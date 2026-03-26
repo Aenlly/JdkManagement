@@ -1,0 +1,11 @@
+build/
+build-cmake/
+out/
+.vs/
+.idea/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.ipch
+*.sqlite
