@@ -1,11 +1,11 @@
 #include "providers/python_runtime.h"
 
 #include <sstream>
-#include <iostream>
 #include <unordered_map>
 
 #include "infrastructure/process.h"
 #include "infrastructure/platform_windows.h"
+#include "providers/download_helpers.h"
 
 namespace jkm {
 
@@ -54,21 +54,13 @@ std::vector<std::string> Split(const std::string& value, char delimiter) {
     return parts;
 }
 
-std::string BuildInstallLogHelperScript() {
-    return
-        "function Write-JkmLog {\n"
-        "  param([string]$Message)\n"
-        "  Write-Output ('LOG=' + $Message)\n"
-        "}\n";
-}
-
 std::string BuildInstallScript(const AppPaths& paths, const std::string& selector, const std::string& arch) {
     std::ostringstream script;
     script
         << "$ErrorActionPreference = 'Stop'\n"
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
-        << BuildInstallLogHelperScript()
+        << BuildDownloadHelperScript()
         << "Add-Type -AssemblyName System.IO.Compression.FileSystem\n"
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$arch = '" << EscapePowerShellLiteral(arch) << "'\n"
@@ -82,9 +74,10 @@ std::string BuildInstallScript(const AppPaths& paths, const std::string& selecto
         << "  'x64' { $packageId = 'python' }\n"
         << "  default { throw 'only x64 is currently supported for Python installs' }\n"
         << "}\n"
+        << "$pythonBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_PYTHON_BASE_URL' -DefaultBaseUrl 'https://api.nuget.org'\n"
         << "Write-JkmLog ('Resolving Python package for selector ' + $selector)\n"
-        << "$indexUri = \"https://api.nuget.org/v3-flatcontainer/$packageId/index.json\"\n"
-        << "$index = Invoke-RestMethod -Uri $indexUri -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        << "$indexUri = Join-JkmUri $pythonBaseUrl \"/v3-flatcontainer/$packageId/index.json\"\n"
+        << "$index = Invoke-JkmRestMethod -Uri $indexUri\n"
         << "$versions = @($index.versions | ForEach-Object { [string]$_ })\n"
         << "if (-not $versions -or $versions.Count -eq 0) { throw 'the Python package index returned no versions' }\n"
         << "$selector = $selector.Trim()\n"
@@ -103,12 +96,12 @@ std::string BuildInstallScript(const AppPaths& paths, const std::string& selecto
         << "Write-JkmLog ('Selected Python version ' + $resolvedVersion)\n"
         << "$normalizedVersion = $resolvedVersion.ToLowerInvariant()\n"
         << "$packageName = \"$packageId.$normalizedVersion.nupkg\"\n"
-        << "$packageUri = \"https://api.nuget.org/v3-flatcontainer/$packageId/$normalizedVersion/$packageName\"\n"
+        << "$packageUri = Join-JkmUri $pythonBaseUrl \"/v3-flatcontainer/$packageId/$normalizedVersion/$packageName\"\n"
         << "$checksumUri = \"$packageUri.sha512\"\n"
         << "$expectedChecksum = ''\n"
         << "$expectedChecksumHex = ''\n"
         << "try {\n"
-        << "  $expectedChecksum = ((Invoke-WebRequest -Uri $checksumUri -Headers @{ 'User-Agent' = 'jkm-cpp' }).Content.Trim())\n"
+        << "  $expectedChecksum = ((Invoke-JkmWebRequestContent -Uri $checksumUri).Trim())\n"
         << "  if ($expectedChecksum) {\n"
         << "    $expectedChecksumHex = ([System.BitConverter]::ToString([System.Convert]::FromBase64String($expectedChecksum))).Replace('-', '').ToLowerInvariant()\n"
         << "  }\n"
@@ -151,7 +144,7 @@ std::string BuildInstallScript(const AppPaths& paths, const std::string& selecto
         << "}\n"
         << "if ($needsDownload) {\n"
         << "  Write-JkmLog ('Downloading ' + $packageName)\n"
-        << "  Invoke-WebRequest -Uri $packageUri -OutFile $archivePath -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        << "  Download-JkmFile -Uri $packageUri -Destination $archivePath -Label $packageName\n"
         << "}\n"
         << "if ($expectedChecksumHex) {\n"
         << "  Write-JkmLog ('Verifying package checksum')\n"
@@ -194,6 +187,7 @@ std::string BuildRemoteListScript(const std::string& selector, const std::string
         << "$ErrorActionPreference = 'Stop'\n"
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        << BuildDownloadHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$arch = '" << EscapePowerShellLiteral(arch) << "'\n"
         << "$limit = " << limit << '\n'
@@ -201,8 +195,9 @@ std::string BuildRemoteListScript(const std::string& selector, const std::string
         << "  'x64' { $packageId = 'python' }\n"
         << "  default { throw 'only x64 is currently supported for Python remote queries' }\n"
         << "}\n"
-        << "$indexUri = \"https://api.nuget.org/v3-flatcontainer/$packageId/index.json\"\n"
-        << "$index = Invoke-RestMethod -Uri $indexUri -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        << "$pythonBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_PYTHON_BASE_URL' -DefaultBaseUrl 'https://api.nuget.org'\n"
+        << "$indexUri = Join-JkmUri $pythonBaseUrl \"/v3-flatcontainer/$packageId/index.json\"\n"
+        << "$index = Invoke-JkmRestMethod -Uri $indexUri\n"
         << "$versions = @($index.versions | ForEach-Object { [string]$_ })\n"
         << "if (-not $versions -or $versions.Count -eq 0) { throw 'the Python package index returned no versions' }\n"
         << "$selector = $selector.Trim()\n"
@@ -219,7 +214,7 @@ std::string BuildRemoteListScript(const std::string& selector, const std::string
         << "foreach ($version in $selected) {\n"
         << "  $normalizedVersion = $version.ToLowerInvariant()\n"
         << "  $packageName = \"$packageId.$normalizedVersion.nupkg\"\n"
-        << "  $packageUri = \"https://api.nuget.org/v3-flatcontainer/$packageId/$normalizedVersion/$packageName\"\n"
+        << "  $packageUri = Join-JkmUri $pythonBaseUrl \"/v3-flatcontainer/$packageId/$normalizedVersion/$packageName\"\n"
         << "  $isPrerelease = if ($version.Contains('-')) { 'true' } else { 'false' }\n"
         << "  Write-Output ('ITEM' + \"`t\" + $version + \"`t\" + $packageId + \"`t\" + $packageName + \"`t\" + $packageUri + \"`t\" + $isPrerelease)\n"
         << "}\n";
@@ -279,11 +274,7 @@ bool InstallPythonRuntime(
             BuildInstallScript(paths, selector, arch),
             &process_result,
             error,
-            [](const std::string& line) {
-                if (line.rfind("LOG=", 0) == 0) {
-                    std::cout << line.substr(4) << std::endl;
-                }
-            })) {
+            BuildDownloadOutputLineHandler())) {
         return false;
     }
 

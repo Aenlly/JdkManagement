@@ -1,12 +1,12 @@
 #include "providers/temurin.h"
 
 #include <algorithm>
-#include <iostream>
 #include <sstream>
 #include <unordered_map>
 
 #include "infrastructure/process.h"
 #include "infrastructure/platform_windows.h"
+#include "providers/download_helpers.h"
 
 namespace jkm {
 
@@ -99,12 +99,10 @@ std::string WrapPowerShellScript(const std::string& body) {
         "}\n";
 }
 
+// Temurin uses a richer selector matcher than the other providers, so its install/query scripts share one helper block.
 std::string BuildTemurinSelectorHelperScript() {
     return
-        "function Write-JkmLog {\n"
-        "  param([string]$Message)\n"
-        "  Write-Output ('LOG=' + $Message)\n"
-        "}\n"
+        BuildDownloadHelperScript() +
         "function Get-JkmTemurinFeatureMajor {\n"
         "  param([string]$Selector)\n"
         "  $normalized = $Selector.Trim().ToLowerInvariant()\n"
@@ -183,8 +181,9 @@ std::string BuildInstallScript(const AppPaths& paths, const std::string& selecto
         << "$major = Get-JkmTemurinFeatureMajor $selector\n"
         << "$selectorVariants = Get-JkmTemurinSelectorVariants $selector\n"
         << "$pageSize = 100\n"
-        << "$uri = \"https://api.adoptium.net/v3/assets/feature_releases/$major/ga?architecture=$arch&os=windows&image_type=jdk&jvm_impl=hotspot&heap_size=normal&project=jdk&sort_method=DATE&sort_order=DESC&page_size=$pageSize\"\n"
-        << "$releases = Invoke-RestMethod -Uri $uri -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        << "$temurinBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_TEMURIN_BASE_URL' -DefaultBaseUrl 'https://api.adoptium.net'\n"
+        << "$uri = Join-JkmUri $temurinBaseUrl \"/v3/assets/feature_releases/$major/ga?architecture=$arch&os=windows&image_type=jdk&jvm_impl=hotspot&heap_size=normal&project=jdk&sort_method=DATE&sort_order=DESC&page_size=$pageSize\"\n"
+        << "$releases = Invoke-JkmRestMethod -Uri $uri\n"
         << "if (-not $releases) { throw 'no Temurin releases were returned by the Adoptium API' }\n"
         << "$releases = @($releases | Where-Object { Test-JkmTemurinAssetMatch $_ $selectorVariants })\n"
         << "$asset = $releases[0]\n"
@@ -222,7 +221,7 @@ std::string BuildInstallScript(const AppPaths& paths, const std::string& selecto
         << "}\n"
         << "if ($needsDownload) {\n"
         << "  Write-JkmLog ('Downloading ' + $package.name)\n"
-        << "  Invoke-WebRequest -Uri $package.link -OutFile $archivePath -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        << "  Download-JkmFile -Uri $package.link -Destination $archivePath -Label $package.name\n"
         << "}\n"
         << "Write-JkmLog ('Verifying archive checksum')\n"
         << "$downloadedHash = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToLowerInvariant()\n"
@@ -260,10 +259,13 @@ std::string BuildInstallScript(const AppPaths& paths, const std::string& selecto
 
 std::string BuildAvailableReleasesScript() {
     return WrapPowerShellScript(
-        "$ErrorActionPreference = 'Stop'\n"
-        "$ProgressPreference = 'SilentlyContinue'\n"
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
-        "$info = Invoke-RestMethod -Uri 'https://api.adoptium.net/v3/info/available_releases' -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        std::string(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$ProgressPreference = 'SilentlyContinue'\n"
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n") +
+        BuildDownloadHelperScript() +
+        "$temurinBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_TEMURIN_BASE_URL' -DefaultBaseUrl 'https://api.adoptium.net'\n"
+        "$info = Invoke-JkmRestMethod -Uri (Join-JkmUri $temurinBaseUrl '/v3/info/available_releases')\n"
         "Write-Output ('MOST_RECENT_FEATURE_RELEASE=' + $info.most_recent_feature_release)\n"
         "Write-Output ('MOST_RECENT_LTS=' + $info.most_recent_lts)\n"
         "Write-Output ('AVAILABLE_RELEASES=' + (($info.available_releases | ForEach-Object { [string]$_ }) -join ','))\n"
@@ -283,8 +285,9 @@ std::string BuildRemoteListScript(const std::string& selector, const std::string
         << "$major = Get-JkmTemurinFeatureMajor $selector\n"
         << "$selectorVariants = Get-JkmTemurinSelectorVariants $selector\n"
         << "$pageSize = [Math]::Max($limit, 100)\n"
-        << "$uri = \"https://api.adoptium.net/v3/assets/feature_releases/$major/ga?architecture=$arch&os=windows&image_type=jdk&jvm_impl=hotspot&heap_size=normal&project=jdk&sort_method=DATE&sort_order=DESC&page_size=$pageSize\"\n"
-        << "$releases = Invoke-RestMethod -Uri $uri -Headers @{ 'User-Agent' = 'jkm-cpp' }\n"
+        << "$temurinBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_TEMURIN_BASE_URL' -DefaultBaseUrl 'https://api.adoptium.net'\n"
+        << "$uri = Join-JkmUri $temurinBaseUrl \"/v3/assets/feature_releases/$major/ga?architecture=$arch&os=windows&image_type=jdk&jvm_impl=hotspot&heap_size=normal&project=jdk&sort_method=DATE&sort_order=DESC&page_size=$pageSize\"\n"
+        << "$releases = Invoke-JkmRestMethod -Uri $uri\n"
         << "if (-not $releases) { throw 'no Temurin releases were returned by the Adoptium API' }\n"
         << "$releases = @($releases | Where-Object { Test-JkmTemurinAssetMatch $_ $selectorVariants })\n"
         << "$selected = if ($releases.Count -gt $limit) { $releases[0..($limit - 1)] } else { $releases }\n"
@@ -318,11 +321,7 @@ bool InstallTemurinJdk(
             BuildInstallScript(paths, selector, arch),
             &process_result,
             error,
-            [](const std::string& line) {
-                if (line.rfind("LOG=", 0) == 0) {
-                    std::cout << line.substr(4) << std::endl;
-                }
-            })) {
+            BuildDownloadOutputLineHandler())) {
         return false;
     }
 

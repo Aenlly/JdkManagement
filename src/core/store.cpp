@@ -336,6 +336,57 @@ std::optional<std::string> ParseOptionalField(const std::vector<std::string>& pa
     return parts.size() >= 3 ? std::optional<std::string>(parts[2]) : std::optional<std::string>(std::string{});
 }
 
+bool EnsureParentDirectory(const fs::path& file_path, std::string* error) {
+    std::error_code ec;
+    const auto parent = file_path.parent_path();
+    if (parent.empty()) {
+        return true;
+    }
+
+    fs::create_directories(parent, ec);
+    if (ec) {
+        if (error != nullptr) {
+            *error = "unable to create parent directory for " + PathToUtf8(file_path);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool WriteSettingsMap(
+    const fs::path& file_path,
+    const std::map<std::string, std::string>& values,
+    std::string* error) {
+    if (!EnsureParentDirectory(file_path, error)) {
+        return false;
+    }
+
+    if (values.empty()) {
+        std::error_code ec;
+        fs::remove(file_path, ec);
+        if (ec) {
+            if (error != nullptr) {
+                *error = "unable to remove empty settings store";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    std::ofstream output(file_path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        if (error != nullptr) {
+            *error = "unable to open settings store for writing";
+        }
+        return false;
+    }
+
+    for (const auto& [key, value] : values) {
+        output << key << '\t' << value << '\n';
+    }
+    return true;
+}
+
 void CollectJavaRuntimes(const fs::path& java_root, std::vector<InstalledRuntime>* runtimes) {
     std::error_code ec;
     if (!fs::exists(java_root, ec)) {
@@ -487,7 +538,13 @@ std::vector<std::string> UniqueSelectors(std::initializer_list<std::string> valu
 ActiveRuntimeStore::ActiveRuntimeStore(std::filesystem::path file_path)
     : file_path_(std::move(file_path)) {}
 
+SettingsStore::SettingsStore(std::filesystem::path file_path)
+    : file_path_(std::move(file_path)) {}
+
 EnvironmentSnapshotStore::EnvironmentSnapshotStore(std::filesystem::path file_path)
+    : file_path_(std::move(file_path)) {}
+
+ProjectLockStore::ProjectLockStore(std::filesystem::path file_path)
     : file_path_(std::move(file_path)) {}
 
 std::vector<ActiveRuntime> ActiveRuntimeStore::Load() const {
@@ -622,6 +679,73 @@ bool ActiveRuntimeStore::Clear(std::string* error) const {
 }
 
 const std::filesystem::path& ActiveRuntimeStore::FilePath() const {
+    return file_path_;
+}
+
+std::map<std::string, std::string> SettingsStore::Load(std::string* error) const {
+    std::map<std::string, std::string> values;
+
+    std::ifstream input(file_path_, std::ios::binary);
+    if (!input.is_open()) {
+        return values;
+    }
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        const auto parts = Split(line, '\t');
+        if (parts.empty() || parts[0].empty()) {
+            continue;
+        }
+
+        const auto key = TrimCopy(parts[0]);
+        if (key.empty()) {
+            continue;
+        }
+
+        values[key] = parts.size() >= 2 ? parts[1] : std::string{};
+    }
+
+    if (input.bad() && error != nullptr) {
+        *error = "failed to read settings store";
+    }
+
+    return values;
+}
+
+std::optional<std::string> SettingsStore::Get(const std::string& key, std::string* error) const {
+    const auto values = Load(error);
+    const auto iterator = values.find(key);
+    if (iterator == values.end()) {
+        return std::nullopt;
+    }
+    return iterator->second;
+}
+
+bool SettingsStore::Upsert(const std::string& key, const std::string& value, std::string* error) const {
+    auto values = Load(error);
+    if (error != nullptr && !error->empty()) {
+        return false;
+    }
+
+    values[key] = value;
+    return WriteSettingsMap(file_path_, values, error);
+}
+
+bool SettingsStore::Remove(const std::string& key, std::string* error) const {
+    auto values = Load(error);
+    if (error != nullptr && !error->empty()) {
+        return false;
+    }
+
+    values.erase(key);
+    return WriteSettingsMap(file_path_, values, error);
+}
+
+const std::filesystem::path& SettingsStore::FilePath() const {
     return file_path_;
 }
 
@@ -761,6 +885,99 @@ bool EnvironmentSnapshotStore::Save(const EnvironmentSnapshot& snapshot, std::st
 }
 
 const std::filesystem::path& EnvironmentSnapshotStore::FilePath() const {
+    return file_path_;
+}
+
+bool ProjectLockStore::Exists() const {
+    std::error_code ec;
+    return fs::exists(file_path_, ec);
+}
+
+std::optional<ProjectLockFile> ProjectLockStore::Load(std::string* error) const {
+    std::ifstream input(file_path_, std::ios::binary);
+    if (!input.is_open()) {
+        return std::nullopt;
+    }
+
+    ProjectLockFile lock_file;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        const auto parts = Split(line, '\t');
+        if (parts.empty()) {
+            continue;
+        }
+
+        if (parts[0] == "version") {
+            if (parts.size() >= 2) {
+                lock_file.format_version = parts[1];
+            }
+            continue;
+        }
+
+        if (parts[0] == "created_at_utc") {
+            if (parts.size() >= 2) {
+                lock_file.created_at_utc = parts[1];
+            }
+            continue;
+        }
+
+        if (parts[0] != "runtime" || parts.size() < 5) {
+            continue;
+        }
+
+        const auto runtime_type = ParseRuntimeType(parts[1]);
+        if (!runtime_type.has_value()) {
+            continue;
+        }
+
+        lock_file.entries.push_back(ProjectLockEntry{
+            *runtime_type,
+            parts[2],
+            parts[3],
+            parts[4]
+        });
+    }
+
+    if (lock_file.created_at_utc.empty()) {
+        if (error != nullptr) {
+            *error = "project lock file is missing created_at_utc";
+        }
+        return std::nullopt;
+    }
+
+    return lock_file;
+}
+
+bool ProjectLockStore::Save(const ProjectLockFile& lock_file, std::string* error) const {
+    if (!EnsureParentDirectory(file_path_, error)) {
+        return false;
+    }
+
+    std::ofstream output(file_path_, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        if (error != nullptr) {
+            *error = "unable to open project lock file for writing";
+        }
+        return false;
+    }
+
+    output << "version\t" << lock_file.format_version << '\n';
+    output << "created_at_utc\t" << lock_file.created_at_utc << '\n';
+    for (const auto& entry : lock_file.entries) {
+        output << "runtime\t"
+               << ToString(entry.type) << '\t'
+               << entry.distribution << '\t'
+               << entry.selector << '\t'
+               << entry.arch << '\n';
+    }
+    return true;
+}
+
+const std::filesystem::path& ProjectLockStore::FilePath() const {
     return file_path_;
 }
 

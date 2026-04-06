@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -58,6 +59,19 @@ struct EnvironmentSnapshot {
     std::optional<std::filesystem::path> external_gradle_root;
 };
 
+struct ProjectLockEntry {
+    RuntimeType type{RuntimeType::Java};
+    std::string distribution;
+    std::string selector;
+    std::string arch{"x64"};
+};
+
+struct ProjectLockFile {
+    std::string format_version{"1"};
+    std::string created_at_utc;
+    std::vector<ProjectLockEntry> entries;
+};
+
 class ActiveRuntimeStore {
 public:
     explicit ActiveRuntimeStore(std::filesystem::path file_path);
@@ -73,6 +87,20 @@ private:
     std::filesystem::path file_path_;
 };
 
+class SettingsStore {
+public:
+    explicit SettingsStore(std::filesystem::path file_path);
+
+    std::map<std::string, std::string> Load(std::string* error = nullptr) const;
+    std::optional<std::string> Get(const std::string& key, std::string* error = nullptr) const;
+    bool Upsert(const std::string& key, const std::string& value, std::string* error) const;
+    bool Remove(const std::string& key, std::string* error) const;
+    const std::filesystem::path& FilePath() const;
+
+private:
+    std::filesystem::path file_path_;
+};
+
 class EnvironmentSnapshotStore {
 public:
     explicit EnvironmentSnapshotStore(std::filesystem::path file_path);
@@ -80,6 +108,19 @@ public:
     bool Exists() const;
     std::optional<EnvironmentSnapshot> Load(std::string* error = nullptr) const;
     bool Save(const EnvironmentSnapshot& snapshot, std::string* error) const;
+    const std::filesystem::path& FilePath() const;
+
+private:
+    std::filesystem::path file_path_;
+};
+
+class ProjectLockStore {
+public:
+    explicit ProjectLockStore(std::filesystem::path file_path);
+
+    bool Exists() const;
+    std::optional<ProjectLockFile> Load(std::string* error = nullptr) const;
+    bool Save(const ProjectLockFile& lock_file, std::string* error) const;
     const std::filesystem::path& FilePath() const;
 
 private:

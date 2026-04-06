@@ -62,6 +62,7 @@ AppPaths DetectAppPaths() {
         root / "current" / "go",
         root / "current" / "maven",
         root / "current" / "gradle",
+        root / "state" / "settings.tsv",
         root / "state" / "active_runtimes.tsv",
         root / "state" / "environment_snapshot.tsv",
         root / "state" / "operations.ndjson"

@@ -20,6 +20,7 @@ struct AppPaths {
     std::filesystem::path current_go;
     std::filesystem::path current_maven;
     std::filesystem::path current_gradle;
+    std::filesystem::path settings_store;
     std::filesystem::path active_runtime_store;
     std::filesystem::path environment_snapshot_store;
     std::filesystem::path operations_audit_store;

@@ -34,6 +34,10 @@ private:
     int HandleShell(const std::vector<std::string>& args, const std::string& operation_id);
     int HandleLogs(const std::vector<std::string>& args);
     int HandleEnv(const std::vector<std::string>& args, const std::string& operation_id);
+    int HandleConfig(const std::vector<std::string>& args, const std::string& operation_id);
+    int HandleCache(const std::vector<std::string>& args, const std::string& operation_id);
+    int HandleLock(const std::vector<std::string>& args, const std::string& operation_id);
+    int HandleSync(const std::vector<std::string>& args, const std::string& operation_id);
     int HandlePlaceholder(const std::string& name, const std::string& operation_id);
 
     void PrintHelp() const;
@@ -47,6 +51,7 @@ private:
     AppPaths paths_;
     Logger logger_;
     OperationAuditStore audit_store_;
+    SettingsStore settings_store_;
     ActiveRuntimeStore active_store_;
     EnvironmentSnapshotStore snapshot_store_;
 };

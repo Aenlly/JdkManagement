@@ -1,7 +1,9 @@
 #include "app/app.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -12,6 +14,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 
 #include "core/metadata.h"
 #include "core/models.h"
@@ -31,12 +34,41 @@ namespace {
 
 constexpr const char* kProjectStateDirectoryName = ".jkm";
 constexpr const char* kProjectActiveRuntimeStoreName = "local_runtimes.tsv";
+constexpr const char* kProjectLockFileName = "project.lock.tsv";
 constexpr const char* kShellHookStartMarker = "# >>> JKM Auto Hook >>>";
 constexpr const char* kShellHookEndMarker = "# <<< JKM Auto Hook <<<";
+
+struct ConfigKeyDefinition {
+    const char* canonical_key;
+    const char* env_name;
+    bool is_path{false};
+};
+
+constexpr ConfigKeyDefinition kConfigKeyDefinitions[] = {
+    {"network.proxy", nullptr, false},
+    {"network.http_proxy", nullptr, false},
+    {"network.https_proxy", nullptr, false},
+    {"network.ca_cert", "JDKM_CA_CERT_PATH", true},
+    {"mirror.temurin", "JDKM_SOURCE_TEMURIN_BASE_URL", false},
+    {"mirror.python", "JDKM_SOURCE_PYTHON_BASE_URL", false},
+    {"mirror.node", "JDKM_SOURCE_NODE_BASE_URL", false},
+    {"mirror.go", "JDKM_SOURCE_GO_BASE_URL", false},
+    {"mirror.maven.metadata", "JDKM_SOURCE_MAVEN_METADATA_BASE_URL", false},
+    {"mirror.maven.archive", "JDKM_SOURCE_MAVEN_ARCHIVE_BASE_URL", false},
+    {"mirror.gradle", "JDKM_SOURCE_GRADLE_BASE_URL", false},
+};
+
+struct CacheFileEntry {
+    std::string area;
+    fs::path path;
+    std::uintmax_t size_bytes{0};
+    fs::file_time_type last_write_time{};
+};
 
 std::optional<std::string> TryOptionValue(const std::vector<std::string>& args, const std::string& name);
 std::optional<fs::path> DefaultShellProfilePath(const std::string& shell, std::string* error = nullptr);
 std::string QuotePowerShellString(const std::string& value);
+std::optional<std::string> ReadProcessEnvironmentUtf8(const wchar_t* name);
 
 std::string ScopeFromArgs(const std::vector<std::string>& args) {
     for (const auto& arg : args) {
@@ -111,6 +143,384 @@ std::optional<fs::path> CurrentWorkingDirectory(std::string* error = nullptr) {
         return std::nullopt;
     }
     return cwd;
+}
+
+std::string TrimWhitespace(std::string value) {
+    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' || value.back() == ' ' || value.back() == '\t')) {
+        value.pop_back();
+    }
+
+    std::size_t start = 0;
+    while (start < value.size() && (value[start] == ' ' || value[start] == '\t')) {
+        ++start;
+    }
+    return value.substr(start);
+}
+
+std::string NormalizeConfigKey(std::string value) {
+    value = ToLowerAscii(std::move(value));
+    value.erase(std::remove_if(value.begin(), value.end(), [](char ch) {
+        return ch == '.' || ch == '_' || ch == '-' || ch == ' ';
+    }), value.end());
+    return value;
+}
+
+const ConfigKeyDefinition* FindConfigKeyDefinition(const std::string& key) {
+    const auto normalized = NormalizeConfigKey(key);
+    for (const auto& definition : kConfigKeyDefinitions) {
+        if (NormalizeConfigKey(definition.canonical_key) == normalized) {
+            return &definition;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<fs::path> FindProjectStateDirectory(const fs::path& start_directory) {
+    std::error_code ec;
+    auto current = start_directory.lexically_normal();
+    while (true) {
+        const auto candidate = current / kProjectStateDirectoryName;
+        if (fs::exists(candidate, ec) && fs::is_directory(candidate, ec)) {
+            return candidate;
+        }
+
+        const auto parent = current.parent_path();
+        if (parent.empty() || parent == current) {
+            break;
+        }
+        current = parent;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<fs::path> FindProjectLockFilePath(const fs::path& start_directory) {
+    std::error_code ec;
+    auto current = start_directory.lexically_normal();
+    while (true) {
+        const auto candidate = current / kProjectStateDirectoryName / kProjectLockFileName;
+        if (fs::exists(candidate, ec)) {
+            return candidate;
+        }
+
+        const auto parent = current.parent_path();
+        if (parent.empty() || parent == current) {
+            break;
+        }
+        current = parent;
+    }
+
+    return std::nullopt;
+}
+
+fs::path DefaultProjectStateDirectory(const fs::path& start_directory) {
+    if (const auto existing = FindProjectStateDirectory(start_directory); existing.has_value()) {
+        return *existing;
+    }
+    return start_directory / kProjectStateDirectoryName;
+}
+
+std::optional<fs::path> ResolveProjectLockFilePath(
+    const std::vector<std::string>& args,
+    bool require_existing,
+    std::string* error = nullptr) {
+    const auto explicit_path = TryOptionValue(args, "--lock-file");
+    const auto cwd = CurrentWorkingDirectory(error);
+    if (!cwd.has_value()) {
+        return std::nullopt;
+    }
+
+    if (explicit_path.has_value()) {
+        auto lock_path = PathFromUtf8(*explicit_path);
+        if (lock_path.is_relative()) {
+            lock_path = (*cwd / lock_path).lexically_normal();
+        }
+        if (require_existing) {
+            std::error_code ec;
+            if (!fs::exists(lock_path, ec)) {
+                if (error != nullptr) {
+                    *error = "project lock file was not found at " + PathToUtf8(lock_path);
+                }
+                return std::nullopt;
+            }
+        }
+        return lock_path;
+    }
+
+    if (require_existing) {
+        if (const auto detected = FindProjectLockFilePath(*cwd); detected.has_value()) {
+            return *detected;
+        }
+        if (error != nullptr) {
+            *error = "project lock file was not found; expected " + PathToUtf8(DefaultProjectStateDirectory(*cwd) / kProjectLockFileName);
+        }
+        return std::nullopt;
+    }
+
+    return DefaultProjectStateDirectory(*cwd) / kProjectLockFileName;
+}
+
+bool SetProcessEnvironmentVariableUtf8(
+    const std::string& name,
+    const std::optional<std::string>& value,
+    std::string* error = nullptr) {
+    const auto wide_name = WideFromUtf8(name);
+    std::wstring wide_value;
+    const wchar_t* value_pointer = nullptr;
+    if (value.has_value()) {
+        wide_value = WideFromUtf8(*value);
+        value_pointer = wide_value.c_str();
+    }
+
+    if (!SetEnvironmentVariableW(wide_name.c_str(), value_pointer)) {
+        if (error != nullptr) {
+            *error = "failed to update process environment for " + name;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::string> SettingValue(
+    const std::map<std::string, std::string>& settings,
+    const std::string& key) {
+    const auto iterator = settings.find(key);
+    if (iterator == settings.end()) {
+        return std::nullopt;
+    }
+
+    const auto value = TrimWhitespace(iterator->second);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<std::string> ReadProcessEnvironmentUtf8(const std::string& name) {
+    const auto wide_name = WideFromUtf8(name);
+    return ReadProcessEnvironmentUtf8(wide_name.c_str());
+}
+
+bool EnsureProcessEnvironmentValue(
+    const std::string& name,
+    const std::optional<std::string>& value,
+    std::string* error = nullptr) {
+    if (!value.has_value() || value->empty()) {
+        return true;
+    }
+    if (ReadProcessEnvironmentUtf8(name).has_value()) {
+        return true;
+    }
+    return SetProcessEnvironmentVariableUtf8(name, value, error);
+}
+
+std::string FormatByteSize(std::uintmax_t size_bytes) {
+    std::ostringstream stream;
+    stream << std::fixed;
+    if (size_bytes >= (1024ull * 1024ull * 1024ull)) {
+        stream << std::setprecision(2) << (static_cast<double>(size_bytes) / (1024.0 * 1024.0 * 1024.0)) << " GB";
+    } else if (size_bytes >= (1024ull * 1024ull)) {
+        stream << std::setprecision(1) << (static_cast<double>(size_bytes) / (1024.0 * 1024.0)) << " MB";
+    } else if (size_bytes >= 1024ull) {
+        stream << std::setprecision(1) << (static_cast<double>(size_bytes) / 1024.0) << " KB";
+    } else {
+        stream.unsetf(std::ios::floatfield);
+        stream << size_bytes << " B";
+    }
+    return stream.str();
+}
+
+std::vector<std::pair<std::string, fs::path>> CacheRoots(const AppPaths& paths, const std::string& selector) {
+    const auto normalized = ToLowerAscii(selector);
+    if (normalized.empty() || normalized == "all") {
+        return {
+            {"downloads", paths.downloads},
+            {"temp", paths.temp}
+        };
+    }
+    if (normalized == "downloads") {
+        return {{"downloads", paths.downloads}};
+    }
+    if (normalized == "temp") {
+        return {{"temp", paths.temp}};
+    }
+    return {};
+}
+
+std::vector<CacheFileEntry> CollectCacheFileEntries(
+    const AppPaths& paths,
+    const std::string& selector) {
+    std::vector<CacheFileEntry> entries;
+    const auto roots = CacheRoots(paths, selector);
+    for (const auto& [area, root] : roots) {
+        std::error_code ec;
+        if (!fs::exists(root, ec)) {
+            continue;
+        }
+
+        const auto options = fs::directory_options::skip_permission_denied;
+        for (fs::recursive_directory_iterator iterator(root, options, ec), end; iterator != end; iterator.increment(ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            if (!iterator->is_regular_file(ec)) {
+                continue;
+            }
+
+            const auto size = iterator->file_size(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            const auto last_write = iterator->last_write_time(ec);
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+
+            entries.push_back(CacheFileEntry{
+                area,
+                iterator->path(),
+                static_cast<std::uintmax_t>(size),
+                last_write
+            });
+        }
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const CacheFileEntry& left, const CacheFileEntry& right) {
+        if (left.area != right.area) {
+            return left.area < right.area;
+        }
+        return PathToUtf8(left.path) < PathToUtf8(right.path);
+    });
+    return entries;
+}
+
+std::uintmax_t TotalCacheSize(const std::vector<CacheFileEntry>& entries) {
+    std::uintmax_t total = 0;
+    for (const auto& entry : entries) {
+        total += entry.size_bytes;
+    }
+    return total;
+}
+
+void RemoveEmptyDirectoriesUnder(const fs::path& root) {
+    std::vector<fs::path> directories;
+    std::error_code ec;
+    if (!fs::exists(root, ec)) {
+        return;
+    }
+
+    const auto options = fs::directory_options::skip_permission_denied;
+    for (fs::recursive_directory_iterator iterator(root, options, ec), end; iterator != end; iterator.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (iterator->is_directory(ec)) {
+            directories.push_back(iterator->path());
+        }
+    }
+
+    std::sort(directories.begin(), directories.end(), [](const fs::path& left, const fs::path& right) {
+        return left.native().size() > right.native().size();
+    });
+
+    for (const auto& directory : directories) {
+        std::error_code remove_ec;
+        if (fs::is_empty(directory, remove_ec)) {
+            fs::remove(directory, remove_ec);
+        }
+    }
+}
+
+bool IsManagedRuntimeSelection(const ActiveRuntime& runtime) {
+    return ToLowerAscii(runtime.selected_name) != "original" && ToLowerAscii(runtime.distribution) != "external";
+}
+
+std::optional<std::pair<std::string, std::string>> ParsePythonEnvironmentSelector(const std::string& selector) {
+    const auto separator = selector.find('/');
+    if (separator == std::string::npos || separator == 0 || separator + 1 >= selector.size()) {
+        return std::nullopt;
+    }
+    return std::make_pair(selector.substr(0, separator), selector.substr(separator + 1));
+}
+
+std::string StripArchSuffix(std::string selector, const std::string& arch) {
+    if (selector.empty() || arch.empty()) {
+        return selector;
+    }
+
+    const auto normalized_selector = ToLowerAscii(selector);
+    const auto suffix = "-" + ToLowerAscii(arch);
+    if (normalized_selector.size() > suffix.size() &&
+        normalized_selector.compare(normalized_selector.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        selector.erase(selector.size() - suffix.size());
+    }
+    return selector;
+}
+
+std::string InstallSelectorForLockEntry(const ProjectLockEntry& entry) {
+    if (entry.type == RuntimeType::Python) {
+        if (const auto env_selector = ParsePythonEnvironmentSelector(entry.selector); env_selector.has_value()) {
+            return StripArchSuffix(env_selector->first, entry.arch);
+        }
+        return StripArchSuffix(entry.selector, entry.arch);
+    }
+
+    if (entry.type == RuntimeType::Node || entry.type == RuntimeType::Go) {
+        return StripArchSuffix(entry.selector, entry.arch);
+    }
+
+    return entry.selector;
+}
+
+bool ApplyPersistedNetworkSettings(const SettingsStore& settings_store, std::string* error = nullptr) {
+    std::string load_error;
+    const auto settings = settings_store.Load(&load_error);
+    if (!load_error.empty()) {
+        if (error != nullptr) {
+            *error = load_error;
+        }
+        return false;
+    }
+
+    const auto shared_proxy = SettingValue(settings, "network.proxy");
+    auto http_proxy = SettingValue(settings, "network.http_proxy");
+    auto https_proxy = SettingValue(settings, "network.https_proxy");
+    if (!http_proxy.has_value()) {
+        http_proxy = shared_proxy;
+    }
+    if (!https_proxy.has_value()) {
+        https_proxy = shared_proxy;
+    }
+
+    if (!EnsureProcessEnvironmentValue("JDKM_HTTP_PROXY", http_proxy, error) ||
+        !EnsureProcessEnvironmentValue("JDKM_HTTPS_PROXY", https_proxy, error) ||
+        !EnsureProcessEnvironmentValue("HTTP_PROXY", http_proxy, error) ||
+        !EnsureProcessEnvironmentValue("HTTPS_PROXY", https_proxy, error)) {
+        return false;
+    }
+
+    const auto ca_cert = SettingValue(settings, "network.ca_cert");
+    if (!EnsureProcessEnvironmentValue("JDKM_CA_CERT_PATH", ca_cert, error) ||
+        !EnsureProcessEnvironmentValue("SSL_CERT_FILE", ca_cert, error)) {
+        return false;
+    }
+
+    for (const auto& definition : kConfigKeyDefinitions) {
+        if (definition.env_name == nullptr || std::string(definition.canonical_key) == "network.ca_cert") {
+            continue;
+        }
+        if (!EnsureProcessEnvironmentValue(definition.env_name, SettingValue(settings, definition.canonical_key), error)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 std::optional<fs::path> FindProjectRuntimeStorePath(const fs::path& start_directory) {
@@ -1258,6 +1668,11 @@ struct SortOption {
     bool descending{false};
 };
 
+struct FilterCondition {
+    std::string field;
+    std::string value;
+};
+
 template <typename T>
 struct OutputColumn {
     std::string key;
@@ -1306,6 +1721,7 @@ std::string TrimAscii(std::string value) {
     return std::string(begin, end);
 }
 
+// Remote query fields accept multiple spellings, so normalize everything to a compact lookup key.
 std::string NormalizeColumnKey(const std::string& value) {
     const auto trimmed = TrimAscii(value);
     std::string normalized;
@@ -1343,6 +1759,7 @@ std::string JoinReleaseNumbers(const std::vector<int>& values) {
     return stream.str();
 }
 
+// This keeps version-like strings intuitive without pulling in a dedicated semver parser.
 int CompareNaturalStrings(const std::string& left, const std::string& right) {
     std::size_t left_index = 0;
     std::size_t right_index = 0;
@@ -1470,7 +1887,64 @@ bool ParseSortOption(const std::optional<std::string>& raw_value, SortOption* op
     return true;
 }
 
+bool ParseFilterConditions(
+    const std::optional<std::string>& raw_value,
+    std::vector<FilterCondition>* conditions,
+    std::string* error) {
+    if (conditions == nullptr) {
+        return false;
+    }
+
+    conditions->clear();
+    if (!raw_value.has_value()) {
+        return true;
+    }
+
+    std::stringstream stream(*raw_value);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        item = TrimAscii(item);
+        if (item.empty()) {
+            continue;
+        }
+
+        const auto separator = item.find('=');
+        if (separator == std::string::npos) {
+            if (error != nullptr) {
+                *error = "filter `" + item + "` must use the form field=value";
+            }
+            return false;
+        }
+
+        const auto field = NormalizeColumnKey(item.substr(0, separator));
+        const auto value = TrimAscii(item.substr(separator + 1));
+        if (field.empty()) {
+            if (error != nullptr) {
+                *error = "filter `" + item + "` is missing a field name";
+            }
+            return false;
+        }
+        if (value.empty()) {
+            if (error != nullptr) {
+                *error = "filter `" + item + "` is missing a value";
+            }
+            return false;
+        }
+
+        conditions->push_back({field, value});
+    }
+
+    if (conditions->empty()) {
+        if (error != nullptr) {
+            *error = "--filter cannot be empty";
+        }
+        return false;
+    }
+    return true;
+}
+
 template <typename T>
+// Resolve user-facing column requests once so table and JSON output stay in sync.
 bool ResolveRequestedColumns(
     const std::vector<OutputColumn<T>>& available_columns,
     const std::optional<std::string>& raw_columns,
@@ -1548,6 +2022,43 @@ bool SortRowsByColumn(
 }
 
 template <typename T>
+// Filters are applied against the same display values used by sorting so CLI behavior stays predictable.
+bool ApplyFilters(
+    std::vector<T>* rows,
+    const std::vector<OutputColumn<T>>& available_columns,
+    const std::vector<FilterCondition>& conditions,
+    std::string* error) {
+    if (conditions.empty()) {
+        return true;
+    }
+
+    std::vector<const OutputColumn<T>*> resolved_columns;
+    resolved_columns.reserve(conditions.size());
+    for (const auto& condition : conditions) {
+        const auto match = std::find_if(available_columns.begin(), available_columns.end(), [&condition](const auto& column) {
+            return column.key == condition.field;
+        });
+        if (match == available_columns.end()) {
+            if (error != nullptr) {
+                *error = "unknown filter field `" + condition.field + "`. Supported values: " + JoinColumnKeys(available_columns);
+            }
+            return false;
+        }
+        resolved_columns.push_back(&(*match));
+    }
+
+    rows->erase(std::remove_if(rows->begin(), rows->end(), [&conditions, &resolved_columns](const T& row) {
+        for (std::size_t index = 0; index < conditions.size(); ++index) {
+            if (ToLowerAscii(resolved_columns[index]->table_value(row)) != ToLowerAscii(conditions[index].value)) {
+                return true;
+            }
+        }
+        return false;
+    }), rows->end());
+    return true;
+}
+
+template <typename T>
 void ApplyOutputLimit(std::vector<T>* rows, std::size_t limit) {
     if (rows->size() > limit) {
         rows->resize(limit);
@@ -1614,6 +2125,7 @@ Application::Application(AppPaths paths)
     : paths_(std::move(paths)),
       logger_(paths_.logs),
       audit_store_(paths_.operations_audit_store),
+      settings_store_(paths_.settings_store),
       active_store_(paths_.active_runtime_store),
       snapshot_store_(paths_.environment_snapshot_store) {}
 
@@ -1626,6 +2138,12 @@ int Application::Run(const std::vector<std::string>& args) {
     std::string ensure_error;
     if (!EnsureAppDirectories(paths_, &ensure_error)) {
         std::cerr << "Failed to initialize application directories: " << ensure_error << '\n';
+        return 1;
+    }
+
+    std::string settings_error;
+    if (!ApplyPersistedNetworkSettings(settings_store_, &settings_error)) {
+        std::cerr << "Failed to apply persisted network configuration: " << settings_error << '\n';
         return 1;
     }
 
@@ -1673,6 +2191,14 @@ int Application::Run(const std::vector<std::string>& args) {
         exit_code = HandleLogs(args);
     } else if (args[0] == "env") {
         exit_code = HandleEnv(args, operation_id);
+    } else if (args[0] == "config") {
+        exit_code = HandleConfig(args, operation_id);
+    } else if (args[0] == "cache") {
+        exit_code = HandleCache(args, operation_id);
+    } else if (args[0] == "lock") {
+        exit_code = HandleLock(args, operation_id);
+    } else if (args[0] == "sync") {
+        exit_code = HandleSync(args, operation_id);
     } else {
         logger_.Error(operation_id, "unknown command", {{"command", args[0]}});
         std::cerr << "Unknown command: " << args[0] << "\n\n";
@@ -1998,7 +2524,8 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
     if (args.size() < 3 || ToLowerAscii(args[1]) != "list") {
         std::cerr << "Usage: jkm remote list <java|python|node|go|maven|gradle> [selector] "
                   << "[--distribution <name>] [--arch x64] [--limit 10] [--latest] "
-                  << "[--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
+                  << "[--format table|json] [--no-headers] [--columns <field,field>] "
+                  << "[--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
         return 1;
     }
 
@@ -2019,6 +2546,7 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
     const auto format = ToLowerAscii(OptionValue(args, "--format", "table"));
     const auto columns_raw = TryOptionValue(args, "--columns");
     const auto sort_raw = TryOptionValue(args, "--sort");
+    const auto filter_raw = TryOptionValue(args, "--filter");
     const bool latest_only = HasFlag(args, "--latest");
     const bool show_headers = !HasFlag(args, "--no-headers");
     if (arch != "x64") {
@@ -2044,6 +2572,15 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
         sort_option = parsed_sort;
     }
 
+    std::vector<FilterCondition> filter_conditions;
+    if (filter_raw.has_value()) {
+        std::string filter_error;
+        if (!ParseFilterConditions(filter_raw, &filter_conditions, &filter_error)) {
+            std::cerr << "Invalid --filter value: " << filter_error << '\n';
+            return 1;
+        }
+    }
+
     int requested_limit = 10;
     try {
         requested_limit = std::stoi(limit_raw);
@@ -2056,7 +2593,9 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
         return 1;
     }
     const int output_limit = latest_only ? 1 : requested_limit;
-    const int query_limit = (latest_only || sort_option.has_value()) ? std::max(output_limit, 50) : output_limit;
+    const int query_limit = (latest_only || sort_option.has_value() || !filter_conditions.empty())
+        ? std::max(output_limit, 50)
+        : output_limit;
 
     if (*runtime_type == RuntimeType::Python) {
         if (distribution != "cpython") {
@@ -2100,6 +2639,10 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
             std::cerr << "Invalid --columns value: " << error << '\n';
             return 1;
         }
+        if (!ApplyFilters(&releases, available_columns, filter_conditions, &error)) {
+            std::cerr << "Invalid --filter value: " << error << '\n';
+            return 1;
+        }
         if (!SortRowsByColumn(&releases, available_columns, sort_option, &error)) {
             std::cerr << "Invalid --sort value: " << error << '\n';
             return 1;
@@ -2117,7 +2660,8 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
                       {"format", format},
                       {"latestOnly", latest_only ? "true" : "false"},
                       {"sort", sort_option.has_value() ? sort_option->field + (sort_option->descending ? ":desc" : ":asc") : ""},
-                      {"columns", columns_raw.has_value() ? *columns_raw : ""}});
+                      {"columns", columns_raw.has_value() ? *columns_raw : ""},
+                      {"filter", filter_raw.has_value() ? *filter_raw : ""}});
 
         if (format == "json") {
             PrintJsonRows(selected_columns, releases);
@@ -2183,17 +2727,28 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
                 return 1;
             }
 
-            logger_.Info(operation_id, "queried Temurin feature releases",
-                         {{"format", format},
-                          {"latestOnly", latest_only ? "true" : "false"},
-                          {"columns", columns_raw.has_value() ? *columns_raw : ""}});
-
-            if (format == "json") {
-                PrintJsonObjectRow(selected_columns, summary);
+            std::vector<TemurinSummaryRow> rows{summary};
+            if (!ApplyFilters(&rows, available_columns, filter_conditions, &error)) {
+                std::cerr << "Invalid --filter value: " << error << '\n';
+                return 1;
+            }
+            if (rows.empty()) {
+                std::cout << "No Temurin feature release summary matched the current filter.\n";
                 return 0;
             }
 
-            PrintTableRows(selected_columns, std::vector<TemurinSummaryRow>{summary}, show_headers);
+            logger_.Info(operation_id, "queried Temurin feature releases",
+                         {{"format", format},
+                          {"latestOnly", latest_only ? "true" : "false"},
+                          {"columns", columns_raw.has_value() ? *columns_raw : ""},
+                          {"filter", filter_raw.has_value() ? *filter_raw : ""}});
+
+            if (format == "json") {
+                PrintJsonObjectRow(selected_columns, rows.front());
+                return 0;
+            }
+
+            PrintTableRows(selected_columns, rows, show_headers);
             std::cout << "Tip: run `jkm remote list java 21` to see concrete Temurin builds.\n";
             return 0;
         }
@@ -2236,6 +2791,10 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
             std::cerr << "Invalid --columns value: " << error << '\n';
             return 1;
         }
+        if (!ApplyFilters(&releases, available_columns, filter_conditions, &error)) {
+            std::cerr << "Invalid --filter value: " << error << '\n';
+            return 1;
+        }
         if (!SortRowsByColumn(&releases, available_columns, sort_option, &error)) {
             std::cerr << "Invalid --sort value: " << error << '\n';
             return 1;
@@ -2253,7 +2812,8 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
                       {"format", format},
                       {"latestOnly", latest_only ? "true" : "false"},
                       {"sort", sort_option.has_value() ? sort_option->field + (sort_option->descending ? ":desc" : ":asc") : ""},
-                      {"columns", columns_raw.has_value() ? *columns_raw : ""}});
+                      {"columns", columns_raw.has_value() ? *columns_raw : ""},
+                      {"filter", filter_raw.has_value() ? *filter_raw : ""}});
 
         if (format == "json") {
             PrintJsonRows(selected_columns, releases);
@@ -2340,6 +2900,10 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
         std::cerr << "Invalid --columns value: " << error << '\n';
         return 1;
     }
+    if (!ApplyFilters(&releases, available_columns, filter_conditions, &error)) {
+        std::cerr << "Invalid --filter value: " << error << '\n';
+        return 1;
+    }
     if (!SortRowsByColumn(&releases, available_columns, sort_option, &error)) {
         std::cerr << "Invalid --sort value: " << error << '\n';
         return 1;
@@ -2353,7 +2917,8 @@ int Application::HandleRemote(const std::vector<std::string>& args, const std::s
                   {"format", format},
                   {"latestOnly", latest_only ? "true" : "false"},
                   {"sort", sort_option.has_value() ? sort_option->field + (sort_option->descending ? ":desc" : ":asc") : ""},
-                  {"columns", columns_raw.has_value() ? *columns_raw : ""}});
+                  {"columns", columns_raw.has_value() ? *columns_raw : ""},
+                  {"filter", filter_raw.has_value() ? *filter_raw : ""}});
 
     if (format == "json") {
         PrintJsonRows(selected_columns, releases);
@@ -3415,6 +3980,7 @@ int Application::HandleShell(const std::vector<std::string>& args, const std::st
 int Application::HandleLogs(const std::vector<std::string>& args) {
     if (args.size() >= 2 && args[1] == "path") {
         std::cout << "logs:     " << PathToUtf8(paths_.logs) << '\n';
+        std::cout << "settings: " << PathToUtf8(settings_store_.FilePath()) << '\n';
         std::cout << "audit:    " << PathToUtf8(audit_store_.FilePath()) << '\n';
         std::cout << "active:   " << PathToUtf8(active_store_.FilePath()) << '\n';
         std::cout << "snapshot: " << PathToUtf8(snapshot_store_.FilePath()) << '\n';
@@ -3509,6 +4075,637 @@ int Application::HandleLogs(const std::vector<std::string>& args) {
     std::cerr << "   or: jkm logs recent [--limit 20] [--command <name>] [--runtime <type>] [--status <succeeded|failed>]\n";
     std::cerr << "   or: jkm logs show --operation <id>\n";
     return 1;
+}
+
+int Application::HandleConfig(const std::vector<std::string>& args, const std::string& operation_id) {
+    if (args.size() >= 2 && args[1] == "path") {
+        std::cout << PathToUtf8(settings_store_.FilePath()) << '\n';
+        return 0;
+    }
+
+    if (args.size() >= 2 && args[1] == "list") {
+        std::string error;
+        const auto settings = settings_store_.Load(&error);
+        if (!error.empty()) {
+            std::cerr << "Failed to read settings: " << error << '\n';
+            return 1;
+        }
+
+        if (settings.empty()) {
+            std::cout << "No persisted configuration values are recorded.\n";
+            return 0;
+        }
+
+        auto remaining = settings;
+        for (const auto& definition : kConfigKeyDefinitions) {
+            const auto iterator = remaining.find(definition.canonical_key);
+            if (iterator == remaining.end()) {
+                continue;
+            }
+
+            std::cout << definition.canonical_key << " = " << iterator->second << '\n';
+            remaining.erase(iterator);
+        }
+
+        for (const auto& [key, value] : remaining) {
+            std::cout << key << " = " << value << '\n';
+        }
+
+        logger_.Info(operation_id, "listed persisted configuration", {{"count", std::to_string(settings.size())}});
+        return 0;
+    }
+
+    if (args.size() >= 3 && args[1] == "get") {
+        const auto* definition = FindConfigKeyDefinition(args[2]);
+        if (definition == nullptr) {
+            std::cerr << "Unknown configuration key: " << args[2] << '\n';
+            return 1;
+        }
+
+        std::string error;
+        const auto value = settings_store_.Get(definition->canonical_key, &error);
+        if (!error.empty()) {
+            std::cerr << "Failed to read settings: " << error << '\n';
+            return 1;
+        }
+
+        if (!value.has_value()) {
+            std::cerr << "No persisted value is recorded for `" << definition->canonical_key << "`.\n";
+            return 1;
+        }
+
+        std::cout << definition->canonical_key << " = " << *value << '\n';
+        return 0;
+    }
+
+    if (args.size() >= 4 && args[1] == "set") {
+        const auto* definition = FindConfigKeyDefinition(args[2]);
+        if (definition == nullptr) {
+            std::cerr << "Unknown configuration key: " << args[2] << '\n';
+            return 1;
+        }
+
+        auto value = TrimWhitespace(args[3]);
+        if (value.empty()) {
+            std::cerr << "Configuration values cannot be empty.\n";
+            return 1;
+        }
+
+        if (definition->is_path) {
+            std::string cwd_error;
+            const auto cwd = CurrentWorkingDirectory(&cwd_error);
+            if (!cwd.has_value()) {
+                std::cerr << "Failed to resolve current directory: " << cwd_error << '\n';
+                return 1;
+            }
+
+            auto path = PathFromUtf8(value);
+            if (path.is_relative()) {
+                path = (*cwd / path).lexically_normal();
+            }
+
+            std::error_code ec;
+            if (!fs::exists(path, ec)) {
+                std::cerr << "Certificate path does not exist: " << PathToUtf8(path) << '\n';
+                return 1;
+            }
+
+            value = PathToUtf8(path);
+        }
+
+        if (std::string(definition->canonical_key).rfind("mirror.", 0) == 0) {
+            while (value.size() > 1 && value.back() == '/') {
+                value.pop_back();
+            }
+        }
+
+        std::string error;
+        if (!settings_store_.Upsert(definition->canonical_key, value, &error)) {
+            std::cerr << "Failed to persist configuration: " << error << '\n';
+            return 1;
+        }
+
+        logger_.Info(operation_id, "saved configuration value",
+                     {{"key", definition->canonical_key}, {"value", value}});
+        std::cout << "Saved " << definition->canonical_key << " = " << value << '\n';
+        return 0;
+    }
+
+    if (args.size() >= 3 && args[1] == "unset") {
+        const auto* definition = FindConfigKeyDefinition(args[2]);
+        if (definition == nullptr) {
+            std::cerr << "Unknown configuration key: " << args[2] << '\n';
+            return 1;
+        }
+
+        std::string error;
+        if (!settings_store_.Remove(definition->canonical_key, &error)) {
+            std::cerr << "Failed to remove configuration: " << error << '\n';
+            return 1;
+        }
+
+        logger_.Info(operation_id, "removed configuration value", {{"key", definition->canonical_key}});
+        std::cout << "Removed " << definition->canonical_key << '\n';
+        return 0;
+    }
+
+    std::cerr << "Usage: jkm config path\n";
+    std::cerr << "   or: jkm config list\n";
+    std::cerr << "   or: jkm config get <key>\n";
+    std::cerr << "   or: jkm config set <key> <value>\n";
+    std::cerr << "   or: jkm config unset <key>\n";
+    return 1;
+}
+
+int Application::HandleCache(const std::vector<std::string>& args, const std::string& operation_id) {
+    if (args.size() < 2) {
+        std::cerr << "Usage: jkm cache list [downloads|temp|all]\n";
+        std::cerr << "   or: jkm cache clear [downloads|temp|all]\n";
+        std::cerr << "   or: jkm cache prune [downloads|temp|all] [--max-size-mb <n>] [--max-age-days <n>] [--dry-run]\n";
+        return 1;
+    }
+
+    const auto subcommand = ToLowerAscii(args[1]);
+    const auto target = args.size() >= 3 && !args[2].empty() && args[2][0] != '-' ? ToLowerAscii(args[2]) : "all";
+    const auto roots = CacheRoots(paths_, target);
+    if (roots.empty()) {
+        std::cerr << "Unknown cache target: " << target << ". Supported values: downloads, temp, all\n";
+        return 1;
+    }
+
+    if (subcommand == "list") {
+        const auto entries = CollectCacheFileEntries(paths_, target);
+        if (entries.empty()) {
+            std::cout << "No cached files were found in " << target << ".\n";
+            return 0;
+        }
+
+        for (const auto& entry : entries) {
+            std::cout << entry.area
+                      << " | " << FormatByteSize(entry.size_bytes)
+                      << " | " << PathToUtf8(entry.path) << '\n';
+        }
+
+        std::cout << "Total: " << entries.size() << " file(s), " << FormatByteSize(TotalCacheSize(entries)) << '\n';
+        logger_.Info(operation_id, "listed cache entries",
+                     {{"target", target}, {"count", std::to_string(entries.size())}});
+        return 0;
+    }
+
+    if (subcommand == "clear") {
+        const auto entries = CollectCacheFileEntries(paths_, target);
+        for (const auto& [area, root] : roots) {
+            (void)area;
+            std::error_code ec;
+            if (!fs::exists(root, ec)) {
+                continue;
+            }
+
+            for (fs::directory_iterator iterator(root, ec), end; iterator != end; iterator.increment(ec)) {
+                if (ec) {
+                    std::cerr << "Failed to enumerate cache path " << PathToUtf8(root) << ": " << ec.message() << '\n';
+                    return 1;
+                }
+
+                std::error_code remove_ec;
+                fs::remove_all(iterator->path(), remove_ec);
+                if (remove_ec) {
+                    std::cerr << "Failed to remove cache entry " << PathToUtf8(iterator->path()) << ": " << remove_ec.message() << '\n';
+                    return 1;
+                }
+            }
+
+            fs::create_directories(root, ec);
+            if (ec) {
+                std::cerr << "Failed to recreate cache directory " << PathToUtf8(root) << ": " << ec.message() << '\n';
+                return 1;
+            }
+        }
+
+        std::cout << "Removed " << entries.size() << " cached file(s), freeing "
+                  << FormatByteSize(TotalCacheSize(entries)) << ".\n";
+        logger_.Info(operation_id, "cleared cache",
+                     {{"target", target}, {"count", std::to_string(entries.size())}});
+        return 0;
+    }
+
+    if (subcommand == "prune") {
+        const auto max_size_raw = TryOptionValue(args, "--max-size-mb");
+        const auto max_age_raw = TryOptionValue(args, "--max-age-days");
+        const bool dry_run = HasFlag(args, "--dry-run");
+
+        std::optional<std::uintmax_t> max_size_bytes;
+        std::optional<int> max_age_days;
+
+        if (max_size_raw.has_value()) {
+            try {
+                const auto size_mb = std::stoll(*max_size_raw);
+                if (size_mb <= 0) {
+                    throw std::invalid_argument("non-positive");
+                }
+                max_size_bytes = static_cast<std::uintmax_t>(size_mb) * 1024ull * 1024ull;
+            } catch (...) {
+                std::cerr << "Invalid --max-size-mb value: " << *max_size_raw << '\n';
+                return 1;
+            }
+        }
+
+        if (max_age_raw.has_value()) {
+            try {
+                const auto age_days = std::stoi(*max_age_raw);
+                if (age_days <= 0) {
+                    throw std::invalid_argument("non-positive");
+                }
+                max_age_days = age_days;
+            } catch (...) {
+                std::cerr << "Invalid --max-age-days value: " << *max_age_raw << '\n';
+                return 1;
+            }
+        }
+
+        if (!max_size_bytes.has_value() && !max_age_days.has_value()) {
+            std::cerr << "Prune requires --max-size-mb, --max-age-days, or both.\n";
+            return 1;
+        }
+
+        const auto entries = CollectCacheFileEntries(paths_, target);
+        if (entries.empty()) {
+            std::cout << "No cached files were found in " << target << ".\n";
+            return 0;
+        }
+
+        std::vector<bool> marked(entries.size(), false);
+        if (max_age_days.has_value()) {
+            const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24LL * static_cast<long long>(*max_age_days));
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+                if (entries[index].last_write_time <= cutoff) {
+                    marked[index] = true;
+                }
+            }
+        }
+
+        std::uintmax_t remaining_size = 0;
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (!marked[index]) {
+                remaining_size += entries[index].size_bytes;
+            }
+        }
+
+        if (max_size_bytes.has_value() && remaining_size > *max_size_bytes) {
+            std::vector<std::size_t> candidates;
+            for (std::size_t index = 0; index < entries.size(); ++index) {
+                if (!marked[index]) {
+                    candidates.push_back(index);
+                }
+            }
+
+            std::sort(candidates.begin(), candidates.end(), [&entries](std::size_t left, std::size_t right) {
+                return entries[left].last_write_time < entries[right].last_write_time;
+            });
+
+            for (const auto index : candidates) {
+                if (remaining_size <= *max_size_bytes) {
+                    break;
+                }
+                marked[index] = true;
+                remaining_size -= entries[index].size_bytes;
+            }
+        }
+
+        std::vector<CacheFileEntry> removed_entries;
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (marked[index]) {
+                removed_entries.push_back(entries[index]);
+            }
+        }
+
+        if (removed_entries.empty()) {
+            std::cout << "No cache entries matched the current prune policy.\n";
+            return 0;
+        }
+
+        const auto removed_size = TotalCacheSize(removed_entries);
+        if (dry_run) {
+            for (const auto& entry : removed_entries) {
+                std::cout << "Would remove " << entry.area
+                          << " | " << FormatByteSize(entry.size_bytes)
+                          << " | " << PathToUtf8(entry.path) << '\n';
+            }
+            std::cout << "Dry run: " << removed_entries.size() << " file(s), "
+                      << FormatByteSize(removed_size) << " would be removed.\n";
+            return 0;
+        }
+
+        for (const auto& entry : removed_entries) {
+            std::error_code ec;
+            fs::remove(entry.path, ec);
+            if (ec) {
+                std::cerr << "Failed to remove cache entry " << PathToUtf8(entry.path) << ": " << ec.message() << '\n';
+                return 1;
+            }
+        }
+
+        for (const auto& [area, root] : roots) {
+            (void)area;
+            RemoveEmptyDirectoriesUnder(root);
+        }
+
+        const auto remaining_entries = CollectCacheFileEntries(paths_, target);
+        std::cout << "Pruned " << removed_entries.size() << " file(s), freeing "
+                  << FormatByteSize(removed_size) << ". Remaining cache size: "
+                  << FormatByteSize(TotalCacheSize(remaining_entries)) << ".\n";
+        logger_.Info(operation_id, "pruned cache",
+                     {{"target", target}, {"removedCount", std::to_string(removed_entries.size())}});
+        return 0;
+    }
+
+    std::cerr << "Unknown cache subcommand: " << args[1] << '\n';
+    std::cerr << "Usage: jkm cache list [downloads|temp|all]\n";
+    std::cerr << "   or: jkm cache clear [downloads|temp|all]\n";
+    std::cerr << "   or: jkm cache prune [downloads|temp|all] [--max-size-mb <n>] [--max-age-days <n>] [--dry-run]\n";
+    return 1;
+}
+
+int Application::HandleLock(const std::vector<std::string>& args, const std::string& operation_id) {
+    if (args.size() < 2) {
+        std::cerr << "Usage: jkm lock path [--lock-file <path>]\n";
+        std::cerr << "   or: jkm lock show [--lock-file <path>]\n";
+        std::cerr << "   or: jkm lock write [--lock-file <path>]\n";
+        return 1;
+    }
+
+    const auto subcommand = ToLowerAscii(args[1]);
+    if (subcommand == "path") {
+        std::string error;
+        const auto lock_path = ResolveProjectLockFilePath(args, false, &error);
+        if (!lock_path.has_value()) {
+            std::cerr << "Failed to resolve lock file path: " << error << '\n';
+            return 1;
+        }
+
+        std::cout << PathToUtf8(*lock_path) << '\n';
+        return 0;
+    }
+
+    if (subcommand == "show") {
+        std::string error;
+        const auto lock_path = ResolveProjectLockFilePath(args, true, &error);
+        if (!lock_path.has_value()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+
+        ProjectLockStore lock_store(*lock_path);
+        const auto lock_file = lock_store.Load(&error);
+        if (!lock_file.has_value()) {
+            std::cerr << "Failed to read project lock file: " << error << '\n';
+            return 1;
+        }
+
+        std::cout << "path:       " << PathToUtf8(lock_store.FilePath()) << '\n';
+        std::cout << "version:    " << lock_file->format_version << '\n';
+        std::cout << "createdAt:  " << lock_file->created_at_utc << '\n';
+        std::cout << "entryCount: " << lock_file->entries.size() << '\n';
+        for (const auto& entry : lock_file->entries) {
+            std::cout << ToString(entry.type)
+                      << " | " << entry.distribution
+                      << " | selector=" << entry.selector;
+            if (!entry.arch.empty()) {
+                std::cout << " | arch=" << entry.arch;
+            }
+            std::cout << '\n';
+        }
+
+        logger_.Info(operation_id, "displayed project lock file",
+                     {{"path", PathToUtf8(lock_store.FilePath())},
+                      {"entryCount", std::to_string(lock_file->entries.size())}});
+        return 0;
+    }
+
+    if (subcommand == "write") {
+        std::string error;
+        const auto lock_path = ResolveProjectLockFilePath(args, false, &error);
+        if (!lock_path.has_value()) {
+            std::cerr << "Failed to resolve lock file path: " << error << '\n';
+            return 1;
+        }
+
+        const auto effective_runtimes = EffectiveActiveRuntimeMap(active_store_);
+        const auto installed = LoadKnownRuntimes();
+        const std::array<RuntimeType, 6> runtime_order{
+            RuntimeType::Java,
+            RuntimeType::Python,
+            RuntimeType::Node,
+            RuntimeType::Go,
+            RuntimeType::Maven,
+            RuntimeType::Gradle
+        };
+
+        std::vector<ProjectLockEntry> entries;
+        std::vector<std::string> skipped;
+        for (const auto runtime_type : runtime_order) {
+            const auto iterator = effective_runtimes.find(runtime_type);
+            if (iterator == effective_runtimes.end()) {
+                continue;
+            }
+
+            const auto& active_runtime = iterator->second;
+            if (!IsManagedRuntimeSelection(active_runtime)) {
+                skipped.push_back(ToString(runtime_type));
+                continue;
+            }
+
+            auto selector = active_runtime.selected_name;
+            const auto matches = FindInstalledRuntimeMatches(installed, runtime_type, active_runtime.selected_name);
+            if (!matches.empty()) {
+                selector = PreferredInstalledRuntimeSelector(matches.front());
+            }
+
+            auto arch = std::string{"x64"};
+            if (runtime_type == RuntimeType::Maven || runtime_type == RuntimeType::Gradle) {
+                arch.clear();
+            }
+
+            entries.push_back(ProjectLockEntry{
+                runtime_type,
+                active_runtime.distribution.empty() ? DefaultDistribution(runtime_type) : active_runtime.distribution,
+                selector,
+                arch
+            });
+        }
+
+        if (entries.empty()) {
+            std::cerr << "No managed active runtimes are available to write into the project lock file.\n";
+            return 1;
+        }
+
+        ProjectLockStore lock_store(*lock_path);
+        ProjectLockFile lock_file;
+        lock_file.created_at_utc = NowUtcIso8601();
+        lock_file.entries = std::move(entries);
+        if (!lock_store.Save(lock_file, &error)) {
+            std::cerr << "Failed to write project lock file: " << error << '\n';
+            return 1;
+        }
+
+        std::cout << "Wrote project lock file: " << PathToUtf8(lock_store.FilePath()) << '\n';
+        std::cout << "Entries: " << lock_file.entries.size() << '\n';
+        if (!skipped.empty()) {
+            std::cout << "Skipped preserved external selections:";
+            for (const auto& item : skipped) {
+                std::cout << ' ' << item;
+            }
+            std::cout << '\n';
+        }
+
+        logger_.Info(operation_id, "wrote project lock file",
+                     {{"path", PathToUtf8(lock_store.FilePath())},
+                      {"entryCount", std::to_string(lock_file.entries.size())}});
+        return 0;
+    }
+
+    std::cerr << "Unknown lock subcommand: " << args[1] << '\n';
+    std::cerr << "Usage: jkm lock path [--lock-file <path>]\n";
+    std::cerr << "   or: jkm lock show [--lock-file <path>]\n";
+    std::cerr << "   or: jkm lock write [--lock-file <path>]\n";
+    return 1;
+}
+
+int Application::HandleSync(const std::vector<std::string>& args, const std::string& operation_id) {
+    const auto scope = HasFlag(args, "--local") ? "local" : ToLowerAscii(OptionValue(args, "--scope", "local"));
+    if (scope != "user" && scope != "local") {
+        std::cerr << "Only --scope user and --scope local are supported right now.\n";
+        return 1;
+    }
+
+    std::string error;
+    const auto lock_path = ResolveProjectLockFilePath(args, true, &error);
+    if (!lock_path.has_value()) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+
+    ProjectLockStore lock_store(*lock_path);
+    const auto lock_file = lock_store.Load(&error);
+    if (!lock_file.has_value()) {
+        std::cerr << "Failed to read project lock file: " << error << '\n';
+        return 1;
+    }
+
+    if (lock_file->entries.empty()) {
+        std::cout << "The project lock file does not contain any runtime entries.\n";
+        return 0;
+    }
+
+    std::optional<fs::path> original_cwd;
+    bool changed_directory = false;
+    if (scope == "local") {
+        original_cwd = CurrentWorkingDirectory(&error);
+        if (!original_cwd.has_value()) {
+            std::cerr << "Failed to resolve current directory: " << error << '\n';
+            return 1;
+        }
+
+        const auto project_root = lock_store.FilePath().parent_path().parent_path();
+        std::error_code ec;
+        fs::current_path(project_root, ec);
+        if (ec) {
+            std::cerr << "Failed to switch to project root " << PathToUtf8(project_root) << ": " << ec.message() << '\n';
+            return 1;
+        }
+        changed_directory = true;
+    }
+
+    auto restore_cwd = [&]() {
+        if (!changed_directory || !original_cwd.has_value()) {
+            return;
+        }
+        std::error_code ec;
+        fs::current_path(*original_cwd, ec);
+    };
+
+    auto install_runtime = [&](const ProjectLockEntry& entry, const std::string& selector) -> int {
+        std::vector<std::string> install_args{
+            "install",
+            ToString(entry.type),
+            selector,
+            "--distribution",
+            entry.distribution.empty() ? DefaultDistribution(entry.type) : entry.distribution
+        };
+
+        if (entry.type == RuntimeType::Java ||
+            entry.type == RuntimeType::Python ||
+            entry.type == RuntimeType::Node ||
+            entry.type == RuntimeType::Go) {
+            install_args.push_back("--arch");
+            install_args.push_back(entry.arch.empty() ? "x64" : entry.arch);
+        }
+
+        return HandleInstall(install_args, operation_id);
+    };
+
+    auto use_runtime = [&](RuntimeType type, const std::string& selector) -> int {
+        return HandleUse({"use", ToString(type), selector, "--scope", scope}, operation_id);
+    };
+
+    int synced_count = 0;
+    int exit_code = 0;
+    for (const auto& entry : lock_file->entries) {
+        if (entry.type == RuntimeType::Python) {
+            if (const auto env_selector = ParsePythonEnvironmentSelector(entry.selector); env_selector.has_value()) {
+                const auto base_selector = InstallSelectorForLockEntry(entry);
+                exit_code = install_runtime(entry, base_selector);
+                if (exit_code != 0) {
+                    break;
+                }
+
+                auto installed = LoadKnownRuntimes(RuntimeType::Python);
+                auto environment_matches = FilterPythonEnvironmentRuntimes(
+                    FindInstalledRuntimeMatches(installed, RuntimeType::Python, entry.selector));
+                if (environment_matches.empty()) {
+                    exit_code = HandleEnv({"env", "create", "python", env_selector->second, "--python", base_selector}, operation_id);
+                    if (exit_code != 0) {
+                        break;
+                    }
+                }
+
+                exit_code = use_runtime(entry.type, entry.selector);
+                if (exit_code != 0) {
+                    break;
+                }
+
+                ++synced_count;
+                continue;
+            }
+        }
+
+        const auto install_selector = InstallSelectorForLockEntry(entry);
+        exit_code = install_runtime(entry, install_selector);
+        if (exit_code != 0) {
+            break;
+        }
+
+        exit_code = use_runtime(entry.type, entry.selector);
+        if (exit_code != 0) {
+            break;
+        }
+
+        ++synced_count;
+    }
+
+    restore_cwd();
+    if (exit_code != 0) {
+        return exit_code;
+    }
+
+    std::cout << "Synchronized " << synced_count << " runtime entr"
+                 "ies from " << PathToUtf8(lock_store.FilePath())
+              << " using scope " << scope << ".\n";
+    logger_.Info(operation_id, "synchronized project lock file",
+                 {{"path", PathToUtf8(lock_store.FilePath())},
+                  {"scope", scope},
+                  {"entryCount", std::to_string(synced_count)}});
+    return 0;
 }
 
 int Application::HandleEnv(const std::vector<std::string>& args, const std::string& operation_id) {
@@ -3740,7 +4937,7 @@ void Application::PrintHelp() const {
     std::cout << "  jkm uninstall <java|python|node|go|maven|gradle> <selector>\n";
     std::cout << "  jkm install <java|python|node|go|maven|gradle> <selector> [--distribution <name>] [--arch x64]\n";
     std::cout << "  jkm remove <java|python|node|go|maven|gradle> <selector>\n";
-    std::cout << "  jkm search <java|python|node|go|maven|gradle> [selector] [--distribution <name>] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
+    std::cout << "  jkm search <java|python|node|go|maven|gradle> [selector] [--distribution <name>] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
     std::cout << "  jkm version <java|python|node|go|maven|gradle> [selector]\n";
     std::cout << "  jkm doctor\n";
     std::cout << "  jkm status [java|python|node|go|maven|gradle]\n";
@@ -3753,16 +4950,28 @@ void Application::PrintHelp() const {
     std::cout << "  jkm shell install <powershell|pwsh> [--profile <path>]\n";
     std::cout << "  jkm shell uninstall <powershell|pwsh> [--profile <path>]\n";
     std::cout << "  jkm shell status [powershell|pwsh] [--profile <path>]\n";
-    std::cout << "  jkm remote list java [selector] [--distribution temurin] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
-    std::cout << "  jkm remote list python [selector] [--distribution cpython] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
-    std::cout << "  jkm remote list node [selector] [--distribution nodejs] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
-    std::cout << "  jkm remote list go [selector] [--distribution golang] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
-    std::cout << "  jkm remote list maven [selector] [--distribution apache] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
-    std::cout << "  jkm remote list gradle [selector] [--distribution gradle] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>]\n";
+    std::cout << "  jkm remote list java [selector] [--distribution temurin] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
+    std::cout << "  jkm remote list python [selector] [--distribution cpython] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
+    std::cout << "  jkm remote list node [selector] [--distribution nodejs] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
+    std::cout << "  jkm remote list go [selector] [--distribution golang] [--arch x64] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
+    std::cout << "  jkm remote list maven [selector] [--distribution apache] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
+    std::cout << "  jkm remote list gradle [selector] [--distribution gradle] [--limit 10] [--latest] [--format table|json] [--no-headers] [--columns <field,field>] [--sort <field[:asc|desc]>] [--filter <field=value[,field=value]>]\n";
     std::cout << "  jkm env list python [--python <base-selector>]\n";
     std::cout << "  jkm env create python <env-name> [--python <base-selector>]\n";
     std::cout << "  jkm env remove python <env-selector> [--python <base-selector>]\n";
     std::cout << "  jkm env activate [--shell powershell|cmd]\n";
+    std::cout << "  jkm config path\n";
+    std::cout << "  jkm config list\n";
+    std::cout << "  jkm config get <key>\n";
+    std::cout << "  jkm config set <key> <value>\n";
+    std::cout << "  jkm config unset <key>\n";
+    std::cout << "  jkm cache list [downloads|temp|all]\n";
+    std::cout << "  jkm cache clear [downloads|temp|all]\n";
+    std::cout << "  jkm cache prune [downloads|temp|all] [--max-size-mb <n>] [--max-age-days <n>] [--dry-run]\n";
+    std::cout << "  jkm lock path [--lock-file <path>]\n";
+    std::cout << "  jkm lock show [--lock-file <path>]\n";
+    std::cout << "  jkm lock write [--lock-file <path>]\n";
+    std::cout << "  jkm sync [--scope local|user] [--lock-file <path>]\n";
     std::cout << "  jkm logs path\n";
     std::cout << "  jkm logs recent [--limit 20] [--command <name>] [--runtime <type>] [--status <succeeded|failed>]\n";
     std::cout << "  jkm logs show --operation <id>\n";
@@ -3770,6 +4979,8 @@ void Application::PrintHelp() const {
     std::cout << "Directory layout defaults to %LOCALAPPDATA%\\JdkManagement unless JDKM_HOME is set.\n";
     std::cout << "Original external runtimes are preserved as selector `original` when detected.\n";
     std::cout << "Local project scope is stored in .jkm\\local_runtimes.tsv and overrides global JKM resolution in that directory tree.\n";
+    std::cout << "Project lock files default to .jkm\\project.lock.tsv and can be replayed with `jkm sync`.\n";
+    std::cout << "Persisted mirror, proxy, and certificate settings are managed with `jkm config` and stored under state\\settings.tsv.\n";
     std::cout << "Remote query fields accept camelCase, snake_case, or kebab-case spellings such as `packageName`, `package_name`, or `package-name`.\n";
     std::cout << "Use `jkm shell install powershell` or `jkm shell install pwsh` to enable automatic local activation on prompt refresh.\n";
 }

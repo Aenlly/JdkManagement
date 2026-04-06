@@ -16,6 +16,7 @@ add_executable(jkm
     src/infrastructure/logger.cpp
     src/infrastructure/process.cpp
     src/infrastructure/platform_windows.cpp
+    src/providers/download_helpers.cpp
     src/providers/temurin.cpp
     src/providers/python_runtime.cpp
     src/providers/tool_runtime.cpp
