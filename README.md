@@ -81,6 +81,8 @@ jkm lock write [--lock-file <path>]
 jkm sync [--scope local|user] [--lock-file <path>]
 ```
 
+`jkm use <type> <selector>` with user scope now ensures `JDKM_HOME` and the managed `current\...\bin` entries exist in the persistent user `PATH`, so a separate `jkm init` is optional for new terminal sessions.
+
 ## Persisted Mirror, Proxy, and Certificate Settings
 
 Settings are stored in `state/settings.tsv` and are applied when the CLI starts.
@@ -205,9 +207,10 @@ Default paths:
 ## Usage Examples
 
 ```powershell
-jkm init
 jkm install java 21
 jkm use java 21
+jkm install gradle 8.10.1
+jkm use gradle 8.10.1
 jkm install node 22 --arch x64
 jkm use node 22 --local
 jkm config set mirror.node https://mirror.example.com/node

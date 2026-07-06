@@ -3040,19 +3040,10 @@ int Application::HandleInit(const std::string& operation_id) {
     }
 
     std::string error;
-    if (!SetUserEnvironmentVariable("JDKM_HOME", PathToUtf8(paths_.root), &error)) {
-        logger_.Error(operation_id, "failed to set JDKM_HOME", {{"error", error}});
-        std::cerr << "Failed to set JDKM_HOME: " << error << '\n';
+    if (!EnsureUserEnvironmentInitialized(&error)) {
+        logger_.Error(operation_id, "failed to initialize persistent user environment", {{"error", error}});
+        std::cerr << "Failed to initialize persistent user environment: " << error << '\n';
         return 1;
-    }
-
-    for (const auto& entry : ManagedPathEntries(paths_)) {
-        if (!EnsureUserPathEntry(entry, &error)) {
-            logger_.Error(operation_id, "failed to update user PATH",
-                          {{"error", error}, {"entry", PathToUtf8(entry)}});
-            std::cerr << "Failed to update user PATH: " << error << '\n';
-            return 1;
-        }
     }
 
     if (!BroadcastEnvironmentChanged(&error)) {
@@ -3070,6 +3061,20 @@ int Application::HandleInit(const std::string& operation_id) {
     }
     std::cout << "Open a new terminal to pick up persistent environment variable changes.\n";
     return 0;
+}
+
+bool Application::EnsureUserEnvironmentInitialized(std::string* error) {
+    if (!SetUserEnvironmentVariable("JDKM_HOME", PathToUtf8(paths_.root), error)) {
+        return false;
+    }
+
+    for (const auto& entry : ManagedPathEntries(paths_)) {
+        if (!EnsureUserPathEntry(entry, error)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 int Application::HandleDeinit(const std::string& operation_id) {
@@ -3259,7 +3264,7 @@ std::vector<DoctorCheck> Application::BuildDoctorChecks() const {
             all_entries_ok ? "OK" : "WARN",
             "persistent PATH entries",
             all_entries_ok ? "runtime shims are registered in the user PATH"
-                           : "run `jkm init` to register current runtime paths in the user PATH"
+                           : "run `jkm init` or any user-scoped `jkm use` command to register current runtime paths in the user PATH"
         });
     }
 
@@ -3573,6 +3578,12 @@ int Application::HandleUse(const std::vector<std::string>& args, const std::stri
         return 1;
     }
 
+    if (!EnsureUserEnvironmentInitialized(&error)) {
+        logger_.Error(operation_id, "failed to initialize persistent user environment", {{"error", error}});
+        std::cerr << "Failed to initialize persistent user environment: " << error << '\n';
+        return 1;
+    }
+
     if (!RepointDirectoryJunction(current_link, selected.root, &error)) {
         logger_.Error(operation_id, "failed to repoint current runtime link", {{"error", error}});
         std::cerr << "Failed to update current runtime link: " << error << '\n';
@@ -3683,6 +3694,7 @@ int Application::HandleUse(const std::vector<std::string>& args, const std::stri
     std::cout << "Switched " << ToString(selected.type) << " to " << selected.name << '\n';
     std::cout << "Current link: " << PathToUtf8(current_link) << '\n';
     std::cout << "Target path:  " << PathToUtf8(selected.root) << '\n';
+    std::cout << "Persistent JDKM_HOME and PATH entries are ensured for new terminal sessions.\n";
     std::cout << "Open a new terminal to refresh persistent environment variables in the shell session.\n";
     for (const auto& note : BuildUseDependencyNotes(RuntimeContextAfterUse(active_store_, active_runtime), active_runtime)) {
         std::cout << note << '\n';

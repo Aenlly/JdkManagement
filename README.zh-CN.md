@@ -81,6 +81,8 @@ jkm lock write [--lock-file <path>]
 jkm sync [--scope local|user] [--lock-file <path>]
 ```
 
+用户级 `jkm use <type> <selector>` 现在会自动确保 `JDKM_HOME` 以及受管 `current\...\bin` 路径已写入持久化用户 `PATH`，因此对新终端来说不再必须先单独执行一次 `jkm init`。
+
 ## 统一镜像源、代理与证书配置
 
 配置保存在 `state/settings.tsv`，CLI 启动时会自动加载。
@@ -205,9 +207,10 @@ Windows 构建命令：
 ## 使用示例
 
 ```powershell
-jkm init
 jkm install java 21
 jkm use java 21
+jkm install gradle 8.10.1
+jkm use gradle 8.10.1
 jkm install node 22 --arch x64
 jkm use node 22 --local
 jkm config set mirror.node https://mirror.example.com/node

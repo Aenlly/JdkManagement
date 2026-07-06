@@ -46,6 +46,7 @@ private:
     std::vector<DoctorCheck> BuildDoctorChecks() const;
     std::vector<InstalledRuntime> LoadKnownRuntimes(std::optional<RuntimeType> filter = std::nullopt) const;
     bool EnsureEnvironmentSnapshotCaptured(const std::string& operation_id);
+    bool EnsureUserEnvironmentInitialized(std::string* error);
     std::optional<EnvironmentSnapshot> LoadEnvironmentSnapshot() const;
 
     AppPaths paths_;
