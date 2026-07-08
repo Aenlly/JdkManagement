@@ -824,6 +824,155 @@ std::vector<fs::path> RuntimePathEntries(const ActiveRuntime& runtime) {
     }
 }
 
+std::vector<std::string> CommandNamesForRuntime(RuntimeType type) {
+    switch (type) {
+        case RuntimeType::Java:
+            return {"java.exe"};
+        case RuntimeType::Python:
+            return {"python.exe"};
+        case RuntimeType::Node:
+            return {"node.exe"};
+        case RuntimeType::Go:
+            return {"go.exe"};
+        case RuntimeType::Maven:
+            return {"mvn.cmd", "mvn.bat"};
+        case RuntimeType::Gradle:
+            return {"gradle.bat", "gradle.cmd"};
+        default:
+            return {};
+    }
+}
+
+std::vector<fs::path> RuntimeExecutableCandidates(RuntimeType type, const fs::path& root) {
+    std::vector<fs::path> candidates;
+    for (const auto& path_entry : RuntimePathEntries(ActiveRuntime{type, {}, {}, root, {}, {}})) {
+        for (const auto& command_name : CommandNamesForRuntime(type)) {
+            candidates.push_back(path_entry / command_name);
+        }
+    }
+    return candidates;
+}
+
+std::string NormalizePathForCompare(const fs::path& path) {
+    auto value = PathToUtf8(path.lexically_normal());
+    std::replace(value.begin(), value.end(), '/', '\\');
+    while (!value.empty() && (value.back() == '\\' || value.back() == '/')) {
+        value.pop_back();
+    }
+    return ToLowerAscii(std::move(value));
+}
+
+bool SameWindowsPath(const fs::path& left, const fs::path& right) {
+    return NormalizePathForCompare(left) == NormalizePathForCompare(right);
+}
+
+bool PathStartsWithWindows(const fs::path& candidate, const fs::path& prefix) {
+    const auto normalized_candidate = NormalizePathForCompare(candidate);
+    auto normalized_prefix = NormalizePathForCompare(prefix);
+    if (normalized_candidate == normalized_prefix) {
+        return true;
+    }
+    if (!normalized_prefix.empty() && normalized_prefix.back() != '\\') {
+        normalized_prefix.push_back('\\');
+    }
+    return normalized_candidate.rfind(normalized_prefix, 0) == 0;
+}
+
+std::vector<std::string> SplitPathValue(const std::string& path_value) {
+    std::vector<std::string> entries;
+    std::size_t start = 0;
+    while (start <= path_value.size()) {
+        const auto end = path_value.find(';', start);
+        auto entry = path_value.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        entry = TrimWhitespace(std::move(entry));
+        if (!entry.empty()) {
+            entries.push_back(entry);
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return entries;
+}
+
+std::vector<fs::path> ResolveCommandsOnPath(RuntimeType type, const std::string& path_value) {
+    std::vector<fs::path> matches;
+    const auto command_names = CommandNamesForRuntime(type);
+    for (const auto& path_entry : SplitPathValue(path_value)) {
+        const auto directory = PathFromUtf8(path_entry);
+        for (const auto& command_name : command_names) {
+            const auto candidate = directory / command_name;
+            std::error_code ec;
+            if (!fs::exists(candidate, ec) || fs::is_directory(candidate, ec)) {
+                continue;
+            }
+            const auto duplicate = std::find_if(matches.begin(), matches.end(), [&candidate](const fs::path& existing) {
+                return SameWindowsPath(existing, candidate);
+            });
+            if (duplicate == matches.end()) {
+                matches.push_back(candidate);
+            }
+        }
+    }
+    return matches;
+}
+
+std::optional<fs::path> ResolveFirstCommandOnPath(RuntimeType type, const std::string& path_value) {
+    const auto matches = ResolveCommandsOnPath(type, path_value);
+    if (matches.empty()) {
+        return std::nullopt;
+    }
+    return matches.front();
+}
+
+std::string FormatCommandMatches(const std::vector<fs::path>& matches) {
+    if (matches.empty()) {
+        return "no matches";
+    }
+    std::ostringstream stream;
+    for (std::size_t index = 0; index < matches.size(); ++index) {
+        if (index > 0) {
+            stream << "; ";
+        }
+        stream << PathToUtf8(matches[index]);
+    }
+    return stream.str();
+}
+
+bool CommandResolvesToRuntime(RuntimeType type, const fs::path& root, const fs::path& resolved_executable) {
+    for (const auto& expected : RuntimeExecutableCandidates(type, root)) {
+        if (SameWindowsPath(expected, resolved_executable)) {
+            return true;
+        }
+    }
+    return PathStartsWithWindows(resolved_executable, root);
+}
+
+std::string ActivationHint() {
+    return "run `jkm env activate --shell powershell | Invoke-Expression` in the current shell or reopen a shell with `jkm shell install powershell` enabled";
+}
+
+std::optional<std::string> BuildCommandPrecedenceWarning(const ActiveRuntime& runtime, const std::string& path_value) {
+    const auto matches = ResolveCommandsOnPath(runtime.type, path_value);
+    if (matches.empty()) {
+        return "`" + ToString(runtime.type) + "` command is not found on the current PATH; " + ActivationHint();
+    }
+    const auto& resolved = matches.front();
+    if (CommandResolvesToRuntime(runtime.type, runtime.root, resolved)) {
+        return std::nullopt;
+    }
+
+    auto detail = "`" + ToString(runtime.type) + "` currently resolves to " + PathToUtf8(resolved)
+        + " before JKM runtime " + PathToUtf8(runtime.root) + "; matches: " + FormatCommandMatches(matches)
+        + "; " + ActivationHint();
+    const auto lower = ToLowerAscii(FormatCommandMatches(matches));
+    if (lower.find("nvm") != std::string::npos) {
+        detail += ". nvm was detected ahead of JKM";
+    }
+    return detail;
+}
+
 std::vector<RuntimeType> AllRuntimeTypes() {
     return {
         RuntimeType::Java,
@@ -3068,8 +3217,9 @@ bool Application::EnsureUserEnvironmentInitialized(std::string* error) {
         return false;
     }
 
-    for (const auto& entry : ManagedPathEntries(paths_)) {
-        if (!EnsureUserPathEntry(entry, error)) {
+    const auto managed_entries = ManagedPathEntries(paths_);
+    for (auto iterator = managed_entries.rbegin(); iterator != managed_entries.rend(); ++iterator) {
+        if (!EnsureUserPathEntry(*iterator, error)) {
             return false;
         }
     }
@@ -3328,6 +3478,25 @@ std::vector<DoctorCheck> Application::BuildDoctorChecks() const {
     const auto dependency_checks = BuildRuntimeDependencyChecks(effective_runtimes);
     checks.insert(checks.end(), dependency_checks.begin(), dependency_checks.end());
 
+    const auto process_path = ReadProcessEnvironmentUtf8(L"PATH");
+    if (!process_path.has_value()) {
+        checks.push_back({"WARN", "current shell PATH", "PATH is not available in the current process"});
+    } else {
+        for (const auto& [type, runtime] : effective_runtimes) {
+            (void)type;
+            if (const auto warning = BuildCommandPrecedenceWarning(runtime, *process_path); warning.has_value()) {
+                checks.push_back({"WARN", std::string(ToString(runtime.type)) + " command precedence", *warning});
+            } else {
+                const auto matches = ResolveCommandsOnPath(runtime.type, *process_path);
+                checks.push_back({
+                    "OK",
+                    std::string(ToString(runtime.type)) + " command precedence",
+                    "matches: " + FormatCommandMatches(matches)
+                });
+            }
+        }
+    }
+
     return checks;
 }
 
@@ -3578,15 +3747,20 @@ int Application::HandleUse(const std::vector<std::string>& args, const std::stri
         return 1;
     }
 
-    if (!EnsureUserEnvironmentInitialized(&error)) {
-        logger_.Error(operation_id, "failed to initialize persistent user environment", {{"error", error}});
-        std::cerr << "Failed to initialize persistent user environment: " << error << '\n';
-        return 1;
-    }
+    const auto process_path_before_use = ReadProcessEnvironmentUtf8(L"PATH");
+    const auto precedence_warning_before_use = process_path_before_use.has_value()
+        ? BuildCommandPrecedenceWarning(active_runtime, *process_path_before_use)
+        : std::optional<std::string>{};
 
     if (!RepointDirectoryJunction(current_link, selected.root, &error)) {
         logger_.Error(operation_id, "failed to repoint current runtime link", {{"error", error}});
         std::cerr << "Failed to update current runtime link: " << error << '\n';
+        return 1;
+    }
+
+    if (!EnsureUserEnvironmentInitialized(&error)) {
+        logger_.Error(operation_id, "failed to initialize persistent user environment", {{"error", error}});
+        std::cerr << "Runtime link was updated, but failed to initialize persistent user environment: " << error << '\n';
         return 1;
     }
 
@@ -3696,6 +3870,14 @@ int Application::HandleUse(const std::vector<std::string>& args, const std::stri
     std::cout << "Target path:  " << PathToUtf8(selected.root) << '\n';
     std::cout << "Persistent JDKM_HOME and PATH entries are ensured for new terminal sessions.\n";
     std::cout << "Open a new terminal to refresh persistent environment variables in the shell session.\n";
+    if (const auto executable = CurrentExecutablePath(); executable.has_value()) {
+        std::cout << "Activate current PowerShell now: & " << QuotePowerShellString(PathToUtf8(*executable)) << " env activate --shell powershell | Invoke-Expression\n";
+    } else {
+        std::cout << "Activate current PowerShell now: jkm env activate --shell powershell | Invoke-Expression\n";
+    }
+    if (precedence_warning_before_use.has_value()) {
+        std::cout << "[WARN] Current shell command precedence: " << *precedence_warning_before_use << '\n';
+    }
     for (const auto& note : BuildUseDependencyNotes(RuntimeContextAfterUse(active_store_, active_runtime), active_runtime)) {
         std::cout << note << '\n';
     }

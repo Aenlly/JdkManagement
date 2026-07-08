@@ -31,6 +31,7 @@ function Format-JkmDuration {
   return ('{0:D2}:{1:D2}' -f $minutes, $secs)
 }
 $script:JkmNetworkInitialized = $false
+$script:JkmSourceFallbackBaseUrls = @{}
 $script:JkmTrustedRootCertificates = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
 function Get-JkmEnvironmentValue {
   param([string[]]$Names)
@@ -41,11 +42,62 @@ function Get-JkmEnvironmentValue {
   }
   return ''
 }
+function Test-JkmChinaTimezone {
+  try {
+    $timeZone = [System.TimeZoneInfo]::Local
+    $ids = @(
+      [string]$timeZone.Id,
+      [string]$timeZone.StandardName,
+      [string]$timeZone.DisplayName
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($id in $ids) {
+      if ($id -match '(?i)(^|[\s_/.-])(china|shanghai|chongqing|harbin|urumqi)([\s_/.-]|$)') { return $true }
+    }
+  } catch {
+  }
+  return $false
+}
+function Test-JkmTaobaoMirrorUrl {
+  param([string]$Url)
+  return (-not [string]::IsNullOrWhiteSpace($Url)) -and ($Url -match '(?i)(taobao|npmmirror|cnpmjs)')
+}
+function Register-JkmSourceFallback {
+  param([string]$PrimaryBaseUrl, [string]$FallbackBaseUrl)
+  if ([string]::IsNullOrWhiteSpace($PrimaryBaseUrl) -or [string]::IsNullOrWhiteSpace($FallbackBaseUrl)) { return }
+  $primary = $PrimaryBaseUrl.Trim().TrimEnd('/')
+  $fallback = $FallbackBaseUrl.Trim().TrimEnd('/')
+  if ($primary -and $fallback -and $primary -ne $fallback) { $script:JkmSourceFallbackBaseUrls[$primary] = $fallback }
+}
+function Get-JkmFallbackUri {
+  param([string]$Uri)
+  if ([string]::IsNullOrWhiteSpace($Uri)) { return '' }
+  foreach ($entry in $script:JkmSourceFallbackBaseUrls.GetEnumerator()) {
+    $primary = [string]$entry.Key
+    $fallback = [string]$entry.Value
+    if ($Uri.StartsWith($primary, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return ($fallback + $Uri.Substring($primary.Length))
+    }
+  }
+  return ''
+}
 function Get-JkmSourceBaseUrl {
-  param([string]$EnvironmentVariableName, [string]$DefaultBaseUrl)
+  param([string]$EnvironmentVariableName, [string]$DefaultBaseUrl, [string]$ChinaBaseUrl = '')
   $configured = Get-JkmEnvironmentValue @($EnvironmentVariableName)
-  if ([string]::IsNullOrWhiteSpace($configured)) { return $DefaultBaseUrl.TrimEnd('/') }
-  return $configured.Trim().TrimEnd('/')
+  if (-not [string]::IsNullOrWhiteSpace($configured)) {
+    if (Test-JkmTaobaoMirrorUrl $configured) {
+      Write-JkmLog ('Ignoring Taobao-family mirror from ' + $EnvironmentVariableName + ': ' + $configured)
+    } else {
+      return $configured.Trim().TrimEnd('/')
+    }
+  }
+  $default = $DefaultBaseUrl.TrimEnd('/')
+  if (-not [string]::IsNullOrWhiteSpace($ChinaBaseUrl) -and (Test-JkmChinaTimezone)) {
+    $china = $ChinaBaseUrl.Trim().TrimEnd('/')
+    Write-JkmLog ('Using China mirror for ' + $EnvironmentVariableName + ': ' + $china)
+    Register-JkmSourceFallback -PrimaryBaseUrl $china -FallbackBaseUrl $default
+    return $china
+  }
+  return $default
 }
 function Join-JkmUri {
   param([string]$BaseUrl, [string]$RelativePath)
@@ -110,12 +162,30 @@ function Initialize-JkmNetwork {
 function Invoke-JkmRestMethod {
   param([string]$Uri)
   Initialize-JkmNetwork
-  return Invoke-RestMethod -Uri $Uri -Headers @{ 'User-Agent' = 'jkm-cpp' }
+  try {
+    return Invoke-RestMethod -Uri $Uri -Headers @{ 'User-Agent' = 'jkm-cpp' }
+  } catch {
+    $fallbackUri = Get-JkmFallbackUri $Uri
+    if (-not [string]::IsNullOrWhiteSpace($fallbackUri) -and $fallbackUri -ne $Uri) {
+      Write-JkmLog ('Mirror request failed, retrying official source: ' + $fallbackUri)
+      return Invoke-RestMethod -Uri $fallbackUri -Headers @{ 'User-Agent' = 'jkm-cpp' }
+    }
+    throw
+  }
 }
 function Invoke-JkmWebRequestContent {
   param([string]$Uri)
   Initialize-JkmNetwork
-  return (Invoke-WebRequest -Uri $Uri -Headers @{ 'User-Agent' = 'jkm-cpp' }).Content
+  try {
+    return (Invoke-WebRequest -Uri $Uri -Headers @{ 'User-Agent' = 'jkm-cpp' }).Content
+  } catch {
+    $fallbackUri = Get-JkmFallbackUri $Uri
+    if (-not [string]::IsNullOrWhiteSpace($fallbackUri) -and $fallbackUri -ne $Uri) {
+      Write-JkmLog ('Mirror request failed, retrying official source: ' + $fallbackUri)
+      return (Invoke-WebRequest -Uri $fallbackUri -Headers @{ 'User-Agent' = 'jkm-cpp' }).Content
+    }
+    throw
+  }
 }
 function Get-JkmPartialDownloadPath {
   param([string]$Destination)
@@ -362,6 +432,21 @@ function Download-JkmFile {
       $activeTransferSeconds += [Math]::Max(0.0, ([System.DateTime]::UtcNow - $attemptStartedAt).TotalSeconds)
       $message = Get-JkmDownloadErrorMessage $_.Exception
       if ($attempt -ge $maxAttempts) {
+        $fallbackUri = Get-JkmFallbackUri $Uri
+        if (-not [string]::IsNullOrWhiteSpace($fallbackUri) -and $fallbackUri -ne $Uri) {
+          Write-JkmLog ('Mirror download failed (' + $Label + '): ' + $message + '; retrying official source ' + $fallbackUri)
+          if (Test-Path $partialPath) { Remove-Item -Force $partialPath }
+          $Uri = $fallbackUri
+          $attempt = 0
+          $downloadedBytes = 0
+          $totalBytes = [Int64]-1
+          $didLogTotalBytes = $false
+          $rateStartBytes = 0
+          $lastReportedPercent = -1
+          $smoothedBytesPerSecond = [double]0
+          $smoothedRemainingSeconds = [double]-1
+          continue
+        }
         throw ('download failed after ' + $attempt + ' attempts: ' + $message)
       }
       $resumeBytes = if (Test-Path $partialPath) { [Int64](Get-Item $partialPath).Length } else { [Int64]0 }

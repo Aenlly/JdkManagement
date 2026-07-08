@@ -82,6 +82,7 @@ jkm sync [--scope local|user] [--lock-file <path>]
 ```
 
 用户级 `jkm use <type> <selector>` 现在会自动确保 `JDKM_HOME` 以及受管 `current\...\bin` 路径已写入持久化用户 `PATH`，因此对新终端来说不再必须先单独执行一次 `jkm init`。
+如果机器级 `PATH` 中已有 nvm 等工具排在用户 `PATH` 之前，请安装 shell hook（`jkm shell install powershell` 或 `jkm shell install pwsh`），或在当前会话执行 `jkm env activate --shell powershell | Invoke-Expression`。`jkm doctor` 会报告命令优先级冲突。
 
 ## 统一镜像源、代理与证书配置
 
@@ -105,6 +106,9 @@ jkm sync [--scope local|user] [--lock-file <path>]
 
 - `network.ca_cert` 持久化时会转换为绝对路径。
 - 镜像地址写入时会去掉末尾的 `/`。
+- 未显式配置镜像时，下载器会根据本机时区判断地区：中国时区使用内置的非淘宝国内镜像（在兼容的源上启用），其他地区使用官方源。
+- èªå¨éæ©çå½åéåå¨åæ°æ®ãæ ¡éªåæå½æ¡£è¯·æ±å¤±è´¥æ¶ä¼åéå°å®æ¹æºã
+- 为规避已知镜像侧问题，包含 `taobao`、`npmmirror` 或 `cnpmjs` 的淘宝系镜像地址会被忽略。
 - 下载器优先使用持久化后的 `JDKM_*` 配置；如果未设置，再回退到进程中的 `HTTP_PROXY`、`HTTPS_PROXY`、`SSL_CERT_FILE` 等标准环境变量。
 - 所有运行时 provider 共用同一层下载与网络辅助逻辑。
 

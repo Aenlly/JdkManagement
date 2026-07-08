@@ -54,6 +54,47 @@ std::vector<std::string> Split(const std::string& value, char delimiter) {
     return parts;
 }
 
+std::string BuildToolSourceHelperScript() {
+    return R"PS(function Get-JkmNodeDistBaseUrl {
+  param([string]$BaseUrl)
+  $base = $BaseUrl.TrimEnd('/')
+  if ($base -match '(?i)/(dist|nodejs-release)$') { return $base }
+  return Join-JkmUri $base '/dist'
+}
+function Get-JkmGoMetadataBaseUrl {
+  param([string]$SourceBaseUrl)
+  if ($SourceBaseUrl -match '(?i)/(golang|go)$') { return 'https://go.dev' }
+  return $SourceBaseUrl
+}
+function Join-JkmGoArchiveUri {
+  param([string]$SourceBaseUrl, [string]$FileName)
+  $base = $SourceBaseUrl.TrimEnd('/')
+  if ($base -match '(?i)/(golang|go|dl)$') { return Join-JkmUri $base $FileName }
+  return Join-JkmUri $base ('/dl/' + $FileName)
+}
+function Join-JkmMavenMetadataUri {
+  param([string]$BaseUrl, [string]$PathUnderMaven2)
+  $base = $BaseUrl.TrimEnd('/')
+  if ($base -match '(?i)/maven2$') { return Join-JkmUri $base $PathUnderMaven2 }
+  if ($base -match '(?i)repo\.maven\.apache\.org$') { return Join-JkmUri $base ('/maven2/' + $PathUnderMaven2.TrimStart('/')) }
+  return Join-JkmUri $base $PathUnderMaven2
+}
+function Join-JkmApacheDistUri {
+  param([string]$BaseUrl, [string]$PathUnderDist)
+  $base = $BaseUrl.TrimEnd('/')
+  if ($base -match '(?i)/dist$') { return Join-JkmUri $base $PathUnderDist }
+  if ($base -match '(?i)archive\.apache\.org$') { return Join-JkmUri $base ('/dist/' + $PathUnderDist.TrimStart('/')) }
+  return Join-JkmUri $base $PathUnderDist
+}
+function Get-JkmGradleMetadataBaseUrl {
+  param([string]$SourceBaseUrl, [string]$EnvironmentVariableName)
+  $configured = Get-JkmEnvironmentValue @($EnvironmentVariableName)
+  if (([string]::IsNullOrWhiteSpace($configured) -or (Test-JkmTaobaoMirrorUrl $configured)) -and (Test-JkmChinaTimezone)) { return 'https://services.gradle.org' }
+  return $SourceBaseUrl
+}
+)PS";
+}
+
 bool ParseToolInstallResult(
     RuntimeType type,
     const std::string& distribution,
@@ -165,6 +206,7 @@ std::string BuildNodeRemoteListScript(const std::string& selector, const std::st
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$arch = '" << EscapePowerShellLiteral(arch) << "'\n"
         << "$limit = " << limit << '\n'
@@ -172,8 +214,9 @@ std::string BuildNodeRemoteListScript(const std::string& selector, const std::st
         << "  'x64' { $packageToken = 'win-x64-zip' }\n"
         << "  default { throw 'only x64 is currently supported for Node.js installs' }\n"
         << "}\n"
-        << "$nodeBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_NODE_BASE_URL' -DefaultBaseUrl 'https://nodejs.org'\n"
-        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $nodeBaseUrl '/dist/index.json')) | Where-Object { $_.files -contains $packageToken })\n"
+        << "$nodeBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_NODE_BASE_URL' -DefaultBaseUrl 'https://nodejs.org/dist' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/nodejs-release'\n"
+        << "$nodeDistBaseUrl = Get-JkmNodeDistBaseUrl $nodeBaseUrl\n"
+        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $nodeDistBaseUrl '/index.json')) | Where-Object { $_.files -contains $packageToken })\n"
         << "$normalizedSelector = $selector.Trim().TrimStart('v', 'V')\n"
         << "switch ($normalizedSelector.ToLowerInvariant()) {\n"
         << "  '' {}\n"
@@ -192,10 +235,10 @@ std::string BuildNodeRemoteListScript(const std::string& selector, const std::st
         << "  $versionTag = [string]$release.version\n"
         << "  $version = $versionTag.TrimStart('v', 'V')\n"
         << "  $packageName = \"node-$versionTag-win-x64.zip\"\n"
-        << "  $downloadUrl = Join-JkmUri $nodeBaseUrl \"/dist/$versionTag/$packageName\"\n"
+        << "  $downloadUrl = Join-JkmUri $nodeDistBaseUrl \"/$versionTag/$packageName\"\n"
         << "  $checksum = ''\n"
         << "  try {\n"
-        << "    $shasums = Invoke-JkmWebRequestContent -Uri (Join-JkmUri $nodeBaseUrl \"/dist/$versionTag/SHASUMS256.txt\")\n"
+        << "    $shasums = Invoke-JkmWebRequestContent -Uri (Join-JkmUri $nodeDistBaseUrl \"/$versionTag/SHASUMS256.txt\")\n"
         << "    $match = $shasums -split \"`n\" | Where-Object { $_ -match ('^(?<hash>[0-9a-fA-F]{64})\\s+' + [regex]::Escape($packageName) + '$') } | Select-Object -First 1\n"
         << "    if ($match) { $checksum = ([regex]::Match($match, '^(?<hash>[0-9a-fA-F]{64})')).Groups['hash'].Value.ToLowerInvariant() }\n"
         << "  } catch { $checksum = '' }\n"
@@ -213,6 +256,7 @@ std::string BuildNodeInstallScript(const AppPaths& paths, const std::string& sel
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$arch = '" << EscapePowerShellLiteral(arch) << "'\n"
         << "$downloads = '" << EscapePowerShellLiteral(PathToUtf8(paths.downloads)) << "'\n"
@@ -223,8 +267,9 @@ std::string BuildNodeInstallScript(const AppPaths& paths, const std::string& sel
         << "  'x64' { $packageToken = 'win-x64-zip' }\n"
         << "  default { throw 'only x64 is currently supported for Node.js installs' }\n"
         << "}\n"
-        << "$nodeBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_NODE_BASE_URL' -DefaultBaseUrl 'https://nodejs.org'\n"
-        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $nodeBaseUrl '/dist/index.json')) | Where-Object { $_.files -contains $packageToken })\n"
+        << "$nodeBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_NODE_BASE_URL' -DefaultBaseUrl 'https://nodejs.org/dist' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/nodejs-release'\n"
+        << "$nodeDistBaseUrl = Get-JkmNodeDistBaseUrl $nodeBaseUrl\n"
+        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $nodeDistBaseUrl '/index.json')) | Where-Object { $_.files -contains $packageToken })\n"
         << "$normalizedSelector = $selector.Trim().TrimStart('v', 'V')\n"
         << "switch ($normalizedSelector.ToLowerInvariant()) {\n"
         << "  '' { throw 'selector is required' }\n"
@@ -245,8 +290,8 @@ std::string BuildNodeInstallScript(const AppPaths& paths, const std::string& sel
         << "$resolvedVersion = $versionTag.TrimStart('v', 'V')\n"
         << "Write-JkmLog ('Selected Node.js version ' + $resolvedVersion)\n"
         << "$packageName = \"node-$versionTag-win-x64.zip\"\n"
-        << "$downloadUrl = Join-JkmUri $nodeBaseUrl \"/dist/$versionTag/$packageName\"\n"
-        << "$shasums = Invoke-JkmWebRequestContent -Uri (Join-JkmUri $nodeBaseUrl \"/dist/$versionTag/SHASUMS256.txt\")\n"
+        << "$downloadUrl = Join-JkmUri $nodeDistBaseUrl \"/$versionTag/$packageName\"\n"
+        << "$shasums = Invoke-JkmWebRequestContent -Uri (Join-JkmUri $nodeDistBaseUrl \"/$versionTag/SHASUMS256.txt\")\n"
         << "$checksumLine = $shasums -split \"`n\" | Where-Object { $_ -match ('^(?<hash>[0-9a-fA-F]{64})\\s+' + [regex]::Escape($packageName) + '$') } | Select-Object -First 1\n"
         << "if (-not $checksumLine) { throw 'unable to resolve Node.js package checksum' }\n"
         << "$checksum = ([regex]::Match($checksumLine, '^(?<hash>[0-9a-fA-F]{64})')).Groups['hash'].Value.ToLowerInvariant()\n"
@@ -324,6 +369,7 @@ std::string BuildGoRemoteListScript(const std::string& selector, const std::stri
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$arch = '" << EscapePowerShellLiteral(arch) << "'\n"
         << "$limit = " << limit << '\n'
@@ -331,8 +377,10 @@ std::string BuildGoRemoteListScript(const std::string& selector, const std::stri
         << "  'x64' { $targetArch = 'amd64' }\n"
         << "  default { throw 'only x64 is currently supported for Go installs' }\n"
         << "}\n"
-        << "$goBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GO_BASE_URL' -DefaultBaseUrl 'https://go.dev'\n"
-        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $goBaseUrl '/dl/?mode=json&include=all')) | Where-Object {\n"
+        << "$goBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GO_BASE_URL' -DefaultBaseUrl 'https://go.dev' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/golang'\n"
+        << "Register-JkmSourceFallback -PrimaryBaseUrl $goBaseUrl -FallbackBaseUrl 'https://go.dev/dl'\n"
+        << "$goMetadataBaseUrl = Get-JkmGoMetadataBaseUrl $goBaseUrl\n"
+        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $goMetadataBaseUrl '/dl/?mode=json&include=all')) | Where-Object {\n"
         << "  $_.files | Where-Object { $_.os -eq 'windows' -and $_.arch -eq $targetArch -and $_.kind -eq 'archive' }\n"
         << "})\n"
         << "$normalizedSelector = $selector.Trim()\n"
@@ -358,7 +406,7 @@ std::string BuildGoRemoteListScript(const std::string& selector, const std::stri
         << "  $version = [string]$release.version\n"
         << "  if ($version.StartsWith('go')) { $version = $version.Substring(2) }\n"
         << "  $channel = if ($release.stable) { 'stable' } else { 'prerelease' }\n"
-        << "  $fields = @($version, [string]$file.filename, (Join-JkmUri $goBaseUrl ('/dl/' + [string]$file.filename)), [string]$file.sha256, $channel, [string]$release.version) | ForEach-Object { ($_ -replace \"`t\", ' ') -replace \"`r|`n\", ' ' }\n"
+        << "  $fields = @($version, [string]$file.filename, (Join-JkmGoArchiveUri $goBaseUrl ([string]$file.filename)), [string]$file.sha256, $channel, [string]$release.version) | ForEach-Object { ($_ -replace \"`t\", ' ') -replace \"`r|`n\", ' ' }\n"
         << "  Write-Output ('ITEM' + \"`t\" + ($fields -join \"`t\"))\n"
         << "}\n";
     return script.str();
@@ -371,6 +419,7 @@ std::string BuildGoInstallScript(const AppPaths& paths, const std::string& selec
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$arch = '" << EscapePowerShellLiteral(arch) << "'\n"
         << "$downloads = '" << EscapePowerShellLiteral(PathToUtf8(paths.downloads)) << "'\n"
@@ -381,8 +430,10 @@ std::string BuildGoInstallScript(const AppPaths& paths, const std::string& selec
         << "  'x64' { $targetArch = 'amd64' }\n"
         << "  default { throw 'only x64 is currently supported for Go installs' }\n"
         << "}\n"
-        << "$goBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GO_BASE_URL' -DefaultBaseUrl 'https://go.dev'\n"
-        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $goBaseUrl '/dl/?mode=json&include=all')) | Where-Object {\n"
+        << "$goBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GO_BASE_URL' -DefaultBaseUrl 'https://go.dev' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/golang'\n"
+        << "Register-JkmSourceFallback -PrimaryBaseUrl $goBaseUrl -FallbackBaseUrl 'https://go.dev/dl'\n"
+        << "$goMetadataBaseUrl = Get-JkmGoMetadataBaseUrl $goBaseUrl\n"
+        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $goMetadataBaseUrl '/dl/?mode=json&include=all')) | Where-Object {\n"
         << "  $_.files | Where-Object { $_.os -eq 'windows' -and $_.arch -eq $targetArch -and $_.kind -eq 'archive' }\n"
         << "})\n"
         << "$normalizedSelector = $selector.Trim()\n"
@@ -410,7 +461,7 @@ std::string BuildGoInstallScript(const AppPaths& paths, const std::string& selec
         << "if ($resolvedVersion.StartsWith('go')) { $resolvedVersion = $resolvedVersion.Substring(2) }\n"
         << "Write-JkmLog ('Selected Go version ' + $resolvedVersion)\n"
         << "$packageName = [string]$file.filename\n"
-        << "$downloadUrl = Join-JkmUri $goBaseUrl ('/dl/' + $packageName)\n"
+        << "$downloadUrl = Join-JkmGoArchiveUri $goBaseUrl $packageName\n"
         << "$checksum = ([string]$file.sha256).ToLowerInvariant()\n"
         << "$channel = if ($release.stable) { 'stable' } else { 'prerelease' }\n"
         << "$installName = '{0}-{1}' -f $resolvedVersion, $arch\n"
@@ -480,11 +531,12 @@ std::string BuildMavenRemoteListScript(const std::string& selector, int limit) {
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$limit = " << limit << '\n'
-        << "$mavenMetadataBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_METADATA_BASE_URL' -DefaultBaseUrl 'https://repo.maven.apache.org'\n"
-        << "$mavenArchiveBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_ARCHIVE_BASE_URL' -DefaultBaseUrl 'https://archive.apache.org'\n"
-        << "[xml]$metadata = Invoke-JkmWebRequestContent -Uri (Join-JkmUri $mavenMetadataBaseUrl '/maven2/org/apache/maven/apache-maven/maven-metadata.xml')\n"
+        << "$mavenMetadataBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_METADATA_BASE_URL' -DefaultBaseUrl 'https://repo.maven.apache.org/maven2' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/maven'\n"
+        << "$mavenArchiveBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_ARCHIVE_BASE_URL' -DefaultBaseUrl 'https://archive.apache.org/dist' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/apache'\n"
+        << "[xml]$metadata = Invoke-JkmWebRequestContent -Uri (Join-JkmMavenMetadataUri $mavenMetadataBaseUrl '/org/apache/maven/apache-maven/maven-metadata.xml')\n"
         << "$versions = @($metadata.metadata.versioning.versions.version | ForEach-Object { [string]$_ })\n"
         << "$normalizedSelector = $selector.Trim()\n"
         << "$allowPrerelease = $normalizedSelector -match '(?i)(alpha|beta|rc|milestone|m\\d+)' -or $normalizedSelector.Contains('-')\n"
@@ -503,7 +555,7 @@ std::string BuildMavenRemoteListScript(const std::string& selector, int limit) {
         << "foreach ($version in $selected) {\n"
         << "  $major = ($version -split '\\.')[0]\n"
         << "  $packageName = \"apache-maven-$version-bin.zip\"\n"
-        << "  $downloadUrl = Join-JkmUri $mavenArchiveBaseUrl \"/dist/maven/maven-$major/$version/binaries/$packageName\"\n"
+        << "  $downloadUrl = Join-JkmApacheDistUri $mavenArchiveBaseUrl \"/maven/maven-$major/$version/binaries/$packageName\"\n"
         << "  $checksum = ''\n"
         << "  try { $checksum = ((Invoke-JkmWebRequestContent -Uri ($downloadUrl + '.sha512')).Trim().Split(' ')[0]).ToLowerInvariant() } catch { $checksum = '' }\n"
         << "  $channel = if ($version -match '(?i)(alpha|beta|rc|milestone|m\\d+)') { 'prerelease' } else { 'stable' }\n"
@@ -520,14 +572,15 @@ std::string BuildMavenInstallScript(const AppPaths& paths, const std::string& se
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$downloads = '" << EscapePowerShellLiteral(PathToUtf8(paths.downloads)) << "'\n"
         << "$tempRoot = '" << EscapePowerShellLiteral(PathToUtf8(paths.temp)) << "'\n"
         << "$rootPath = '" << EscapePowerShellLiteral(PathToUtf8(paths.installs / "maven" / "apache")) << "'\n"
         << "New-Item -ItemType Directory -Force -Path $downloads, $tempRoot, $rootPath | Out-Null\n"
-        << "$mavenMetadataBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_METADATA_BASE_URL' -DefaultBaseUrl 'https://repo.maven.apache.org'\n"
-        << "$mavenArchiveBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_ARCHIVE_BASE_URL' -DefaultBaseUrl 'https://archive.apache.org'\n"
-        << "[xml]$metadata = Invoke-JkmWebRequestContent -Uri (Join-JkmUri $mavenMetadataBaseUrl '/maven2/org/apache/maven/apache-maven/maven-metadata.xml')\n"
+        << "$mavenMetadataBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_METADATA_BASE_URL' -DefaultBaseUrl 'https://repo.maven.apache.org/maven2' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/maven'\n"
+        << "$mavenArchiveBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_MAVEN_ARCHIVE_BASE_URL' -DefaultBaseUrl 'https://archive.apache.org/dist' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/apache'\n"
+        << "[xml]$metadata = Invoke-JkmWebRequestContent -Uri (Join-JkmMavenMetadataUri $mavenMetadataBaseUrl '/org/apache/maven/apache-maven/maven-metadata.xml')\n"
         << "$versions = @($metadata.metadata.versioning.versions.version | ForEach-Object { [string]$_ })\n"
         << "$normalizedSelector = $selector.Trim()\n"
         << "$allowPrerelease = $normalizedSelector -match '(?i)(alpha|beta|rc|milestone|m\\d+)' -or $normalizedSelector.Contains('-')\n"
@@ -547,7 +600,7 @@ std::string BuildMavenInstallScript(const AppPaths& paths, const std::string& se
         << "Write-JkmLog ('Selected Maven version ' + $resolvedVersion)\n"
         << "$major = ($resolvedVersion -split '\\.')[0]\n"
         << "$packageName = \"apache-maven-$resolvedVersion-bin.zip\"\n"
-        << "$downloadUrl = Join-JkmUri $mavenArchiveBaseUrl \"/dist/maven/maven-$major/$resolvedVersion/binaries/$packageName\"\n"
+        << "$downloadUrl = Join-JkmApacheDistUri $mavenArchiveBaseUrl \"/maven/maven-$major/$resolvedVersion/binaries/$packageName\"\n"
         << "$checksumResponse = (Invoke-JkmWebRequestContent -Uri ($downloadUrl + '.sha512')).Trim()\n"
         << "$checksum = ($checksumResponse.Split(' ')[0]).ToLowerInvariant()\n"
         << "$channel = if ($resolvedVersion -match '(?i)(alpha|beta|rc|milestone|m\\d+)') { 'prerelease' } else { 'stable' }\n"
@@ -621,11 +674,13 @@ std::string BuildGradleRemoteListScript(const std::string& selector, int limit) 
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$limit = " << limit << '\n'
-        << "$gradleBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GRADLE_BASE_URL' -DefaultBaseUrl 'https://services.gradle.org'\n"
+        << "$gradleBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GRADLE_BASE_URL' -DefaultBaseUrl 'https://services.gradle.org' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/gradle'\n"
         << "$defaultGradleBaseUrl = 'https://services.gradle.org'\n"
-        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $gradleBaseUrl '/versions/all')) | Where-Object {\n"
+        << "$gradleMetadataBaseUrl = Get-JkmGradleMetadataBaseUrl $gradleBaseUrl 'JDKM_SOURCE_GRADLE_BASE_URL'\n"
+        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $gradleMetadataBaseUrl '/versions/all')) | Where-Object {\n"
         << "  -not $_.broken -and -not $_.snapshot -and -not $_.nightly -and -not $_.releaseNightly\n"
         << "})\n"
         << "$normalizedSelector = $selector.Trim()\n"
@@ -667,14 +722,16 @@ std::string BuildGradleInstallScript(const AppPaths& paths, const std::string& s
         << "$ProgressPreference = 'SilentlyContinue'\n"
         << "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
         << BuildDownloadHelperScript()
+        << BuildToolSourceHelperScript()
         << "$selector = '" << EscapePowerShellLiteral(selector) << "'\n"
         << "$downloads = '" << EscapePowerShellLiteral(PathToUtf8(paths.downloads)) << "'\n"
         << "$tempRoot = '" << EscapePowerShellLiteral(PathToUtf8(paths.temp)) << "'\n"
         << "$rootPath = '" << EscapePowerShellLiteral(PathToUtf8(paths.installs / "gradle" / "gradle")) << "'\n"
         << "New-Item -ItemType Directory -Force -Path $downloads, $tempRoot, $rootPath | Out-Null\n"
-        << "$gradleBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GRADLE_BASE_URL' -DefaultBaseUrl 'https://services.gradle.org'\n"
+        << "$gradleBaseUrl = Get-JkmSourceBaseUrl -EnvironmentVariableName 'JDKM_SOURCE_GRADLE_BASE_URL' -DefaultBaseUrl 'https://services.gradle.org' -ChinaBaseUrl 'https://mirrors.tuna.tsinghua.edu.cn/gradle'\n"
         << "$defaultGradleBaseUrl = 'https://services.gradle.org'\n"
-        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $gradleBaseUrl '/versions/all')) | Where-Object {\n"
+        << "$gradleMetadataBaseUrl = Get-JkmGradleMetadataBaseUrl $gradleBaseUrl 'JDKM_SOURCE_GRADLE_BASE_URL'\n"
+        << "$releases = @((Invoke-JkmRestMethod -Uri (Join-JkmUri $gradleMetadataBaseUrl '/versions/all')) | Where-Object {\n"
         << "  -not $_.broken -and -not $_.snapshot -and -not $_.nightly -and -not $_.releaseNightly\n"
         << "})\n"
         << "$normalizedSelector = $selector.Trim()\n"

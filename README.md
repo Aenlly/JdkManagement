@@ -82,6 +82,7 @@ jkm sync [--scope local|user] [--lock-file <path>]
 ```
 
 `jkm use <type> <selector>` with user scope now ensures `JDKM_HOME` and the managed `current\...\bin` entries exist in the persistent user `PATH`, so a separate `jkm init` is optional for new terminal sessions.
+If a machine-level manager such as nvm appears earlier in `PATH`, install the shell hook (`jkm shell install powershell` or `jkm shell install pwsh`) or run `jkm env activate --shell powershell | Invoke-Expression` for the current session. `jkm doctor` reports command precedence conflicts.
 
 ## Persisted Mirror, Proxy, and Certificate Settings
 
@@ -105,6 +106,9 @@ Behavior notes:
 
 - `network.ca_cert` is normalized to an absolute path when persisted.
 - Mirror values are stored without a trailing slash.
+- If a mirror is not configured, the downloader detects the local time zone: China time zones use built-in non-Taobao China mirrors where compatible; other regions use the official upstream URL.
+- Automatically selected China mirrors fall back to the official upstream URL if a metadata, checksum, or archive request fails.
+- Taobao-family mirror URLs (`taobao`, `npmmirror`, or `cnpmjs`) are ignored to avoid known mirror-side issues.
 - The downloader uses persisted `JDKM_*` settings first, then standard process variables such as `HTTP_PROXY`, `HTTPS_PROXY`, and `SSL_CERT_FILE`.
 - The same helper layer is shared by all supported runtime providers.
 

@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <cwctype>
+#include <sstream>
 #include <vector>
 
 #include <windows.h>
+#include <winioctl.h>
 
 namespace fs = std::filesystem;
 
@@ -149,6 +152,149 @@ bool DeleteRegistryValue(HKEY root, const wchar_t* sub_key, const wchar_t* value
     return true;
 }
 
+std::string FormatWindowsError(DWORD error_code) {
+    if (error_code == ERROR_SUCCESS) {
+        return {};
+    }
+
+    wchar_t* message = nullptr;
+    const auto length = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        error_code,
+        0,
+        reinterpret_cast<LPWSTR>(&message),
+        0,
+        nullptr);
+
+    std::string detail;
+    if (length > 0 && message != nullptr) {
+        detail = Utf8FromWide(std::wstring(message, length));
+        while (!detail.empty() && (detail.back() == '\r' || detail.back() == '\n' || detail.back() == ' ' || detail.back() == '\t' || detail.back() == '.')) {
+            detail.pop_back();
+        }
+    }
+    if (message != nullptr) {
+        LocalFree(message);
+    }
+
+    if (detail.empty()) {
+        std::ostringstream stream;
+        stream << "Windows error " << error_code;
+        detail = stream.str();
+    }
+    return detail;
+}
+
+constexpr DWORD kMountPointReparseTag = 0xA0000003L;
+constexpr DWORD kMaxReparseDataBufferSize = 16 * 1024;
+
+struct JkmMountPointReparseBuffer {
+    DWORD ReparseTag;
+    WORD ReparseDataLength;
+    WORD Reserved;
+    WORD SubstituteNameOffset;
+    WORD SubstituteNameLength;
+    WORD PrintNameOffset;
+    WORD PrintNameLength;
+    WCHAR PathBuffer[1];
+};
+
+std::wstring ToAbsoluteNativePath(const fs::path& path) {
+    std::error_code ec;
+    auto absolute = fs::absolute(path, ec);
+    if (ec) {
+        absolute = path;
+    }
+    auto value = absolute.lexically_normal().wstring();
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    if (value.rfind(L"\\??\\", 0) == 0) {
+        return value;
+    }
+    return L"\\??\\" + value;
+}
+
+bool CreateDirectoryJunctionNative(const fs::path& link_path, const fs::path& target_path, std::string* error) {
+    std::error_code ec;
+    fs::create_directory(link_path, ec);
+    if (ec) {
+        if (error != nullptr) {
+            *error = "failed to create junction directory " + PathToUtf8(link_path) + ": " + ec.message();
+        }
+        return false;
+    }
+
+    const auto substitute_name = ToAbsoluteNativePath(target_path);
+    auto print_name = fs::absolute(target_path, ec).lexically_normal().wstring();
+    if (ec) {
+        print_name = target_path.lexically_normal().wstring();
+    }
+    std::replace(print_name.begin(), print_name.end(), L'/', L'\\');
+
+    const auto substitute_bytes = static_cast<WORD>(substitute_name.size() * sizeof(wchar_t));
+    const auto print_bytes = static_cast<WORD>(print_name.size() * sizeof(wchar_t));
+    const auto path_bytes = static_cast<DWORD>(substitute_bytes + sizeof(wchar_t) + print_bytes + sizeof(wchar_t));
+    const auto reparse_data_length = static_cast<WORD>(sizeof(WORD) * 4 + path_bytes);
+    const auto total_size = FIELD_OFFSET(JkmMountPointReparseBuffer, PathBuffer) + path_bytes;
+    if (total_size > kMaxReparseDataBufferSize) {
+        if (error != nullptr) {
+            *error = "junction target path is too long: " + PathToUtf8(target_path);
+        }
+        RemoveDirectoryW(link_path.c_str());
+        return false;
+    }
+
+    std::vector<BYTE> buffer(total_size, 0);
+    auto* reparse = reinterpret_cast<JkmMountPointReparseBuffer*>(buffer.data());
+    reparse->ReparseTag = kMountPointReparseTag;
+    reparse->ReparseDataLength = reparse_data_length;
+    reparse->SubstituteNameOffset = 0;
+    reparse->SubstituteNameLength = substitute_bytes;
+    reparse->PrintNameOffset = static_cast<WORD>(substitute_bytes + sizeof(wchar_t));
+    reparse->PrintNameLength = print_bytes;
+    std::memcpy(reparse->PathBuffer, substitute_name.data(), substitute_bytes);
+    std::memcpy(reinterpret_cast<BYTE*>(reparse->PathBuffer) + reparse->PrintNameOffset, print_name.data(), print_bytes);
+
+    HANDLE handle = CreateFileW(
+        link_path.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const auto open_error = GetLastError();
+        if (error != nullptr) {
+            *error = "failed to open junction directory " + PathToUtf8(link_path) + ": " + FormatWindowsError(open_error);
+        }
+        RemoveDirectoryW(link_path.c_str());
+        return false;
+    }
+
+    DWORD bytes_returned = 0;
+    const BOOL ok = DeviceIoControl(
+        handle,
+        FSCTL_SET_REPARSE_POINT,
+        reparse,
+        total_size,
+        nullptr,
+        0,
+        &bytes_returned,
+        nullptr);
+    const auto ioctl_error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(handle);
+    if (!ok) {
+        if (error != nullptr) {
+            *error = "failed to set junction reparse point " + PathToUtf8(link_path) + ": " + FormatWindowsError(ioctl_error);
+        }
+        RemoveDirectoryW(link_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
 bool RemoveExistingLink(const fs::path& link_path, std::string* error) {
     DWORD attributes = GetFileAttributesW(link_path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -162,11 +308,10 @@ bool RemoveExistingLink(const fs::path& link_path, std::string* error) {
         return false;
     }
 
-    std::wstring command = L"cmd.exe /c rmdir \"" + link_path.wstring() + L"\" >nul 2>nul";
-    const auto exit_code = _wsystem(command.c_str());
-    if (exit_code != 0) {
+    if (!RemoveDirectoryW(link_path.c_str())) {
+        const auto remove_error = GetLastError();
         if (error != nullptr) {
-            *error = "failed to remove existing directory link";
+            *error = "failed to remove existing directory link " + PathToUtf8(link_path) + ": " + FormatWindowsError(remove_error);
         }
         return false;
     }
@@ -241,16 +386,7 @@ bool RepointDirectoryJunction(const std::filesystem::path& link_path, const std:
         return false;
     }
 
-    std::wstring command = L"cmd.exe /c mklink /J \"" + link_path.wstring() + L"\" \"" + target_path.wstring() + L"\" >nul";
-    const auto exit_code = _wsystem(command.c_str());
-    if (exit_code != 0) {
-        if (error != nullptr) {
-            *error = "mklink /J failed";
-        }
-        return false;
-    }
-
-    return true;
+    return CreateDirectoryJunctionNative(link_path, target_path, error);
 }
 
 bool SetUserEnvironmentVariable(const std::string& name, const std::string& value, std::string* error) {
@@ -302,19 +438,30 @@ bool EnsureUserPathEntry(const std::filesystem::path& entry, std::string* error)
     ReadRegistryString(HKEY_CURRENT_USER, L"Environment", L"Path", &current_path, &ignored_error);
 
     const auto normalized_entry = NormalizeWindowsPath(entry.lexically_normal().wstring());
+    std::vector<std::wstring> reordered_entries;
+    reordered_entries.push_back(entry.lexically_normal().wstring());
+
     const auto entries = SplitPath(current_path);
     for (const auto& existing : entries) {
-        if (NormalizeWindowsPath(existing) == normalized_entry) {
-            return true;
+        if (existing.empty() || NormalizeWindowsPath(existing) == normalized_entry) {
+            continue;
         }
+        reordered_entries.push_back(existing);
     }
 
-    if (!current_path.empty() && current_path.back() != L';') {
-        current_path += L';';
+    std::wstring updated_path;
+    for (std::size_t index = 0; index < reordered_entries.size(); ++index) {
+        if (index > 0) {
+            updated_path += L';';
+        }
+        updated_path += reordered_entries[index];
     }
-    current_path += entry.lexically_normal().wstring();
 
-    return SetUserEnvironmentVariable("Path", Utf8FromWide(current_path), error);
+    if (updated_path == current_path) {
+        return true;
+    }
+
+    return SetUserEnvironmentVariable("Path", Utf8FromWide(updated_path), error);
 }
 
 bool RemoveDirectoryJunction(const std::filesystem::path& link_path, std::string* error) {
