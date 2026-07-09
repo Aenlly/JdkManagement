@@ -58,13 +58,17 @@ $resourceObject = "build\\jkm.res"
 $linkLibraries = "advapi32.lib user32.lib"
 $resourceCommand = "rc /nologo /I . /I src /fo $resourceObject $resourceSource"
 $compileCommand = "cl /std:c++20 /EHsc /nologo /W4 /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I src /Fe:build\\jkm.exe $quotedSources $resourceObject $linkLibraries"
+$setupCompileCommand = "cl /std:c++20 /EHsc /nologo /W4 /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I src /Fe:build\jkm-setup.exe src\installer\installer.cpp advapi32.lib user32.lib"
+$uninstallCompileCommand = "cl /std:c++20 /EHsc /nologo /W4 /utf-8 /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DJKM_UNINSTALLER /I src /Fe:build\jkm-uninstall.exe src\installer\installer.cpp advapi32.lib user32.lib"
 $driverScript = Join-Path $buildDir "invoke_build.cmd"
 
 @(
     "@echo off",
     "call `"$vcVars64`"",
     $resourceCommand,
-    $compileCommand
+    $compileCommand,
+    $setupCompileCommand,
+    $uninstallCompileCommand
 ) | Set-Content -Encoding ascii $driverScript
 
 Push-Location $workspace

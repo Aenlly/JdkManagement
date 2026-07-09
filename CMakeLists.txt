@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(JdkManagement LANGUAGES CXX)
+project(JdkManagement VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,4 +28,22 @@ target_include_directories(jkm PRIVATE src)
 if (WIN32)
     target_compile_definitions(jkm PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(jkm PRIVATE advapi32 user32)
+endif()
+
+
+add_executable(jkm-setup
+    src/installer/installer.cpp
+)
+target_include_directories(jkm-setup PRIVATE src)
+
+add_executable(jkm-uninstall
+    src/installer/installer.cpp
+)
+target_include_directories(jkm-uninstall PRIVATE src)
+
+if (WIN32)
+    target_compile_definitions(jkm-setup PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(jkm-setup PRIVATE advapi32 user32)
+    target_compile_definitions(jkm-uninstall PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX JKM_UNINSTALLER)
+    target_link_libraries(jkm-uninstall PRIVATE advapi32 user32)
 endif()

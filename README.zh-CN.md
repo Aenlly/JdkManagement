@@ -4,6 +4,52 @@
 
 JdkManagement 是一个面向 Windows 的多运行时管理原型，使用 C++ 实现，目标是为 Java、Python、Node.js、Go、Maven 和 Gradle 提供统一的安装、切换、查询与激活体验。
 
+## 下载与安装
+
+普通用户安装时，建议下载 Release 包，而不是直接运行 PowerShell 脚本：
+
+- [最新 JdkManagement Release](https://github.com/Aenlly/JdkManagement/releases/latest)
+
+在 **Assets** 中下载 Windows x64 包：
+
+```text
+JdkManagement-windows-x64.zip
+```
+
+解压后运行安装器：
+
+```powershell
+.\JdkManagement-Setup-windows-x64.exe
+```
+
+Release 包中也包含卸载器：
+
+```powershell
+.\JdkManagement-Uninstall-windows-x64.exe
+```
+
+也可以在 Windows 设置 > 应用 > JdkManagement 中卸载。
+
+默认路径：
+
+- 可执行文件：`%LOCALAPPDATA%\Programs\JdkManagement\bin\jkm.exe`
+- 卸载器：`%LOCALAPPDATA%\Programs\JdkManagement\jkm-uninstall.exe`
+- 数据根目录：`%LOCALAPPDATA%\JdkManagement`
+- 如设置 `JDKM_HOME`，则优先使用该目录作为数据根
+
+完整用户流程请参见[下载与安装指南](docs/download.md)。
+
+### 从源码构建
+
+开发者可以在本地构建并打包：
+
+```powershell
+.\build.ps1
+.\scripts\package-jkm.ps1
+```
+
+生成的发布包会写入 `out\package`。
+
 ## 文档维护要求
 
 - `README.md` 和 `README.zh-CN.md` 是必须同步维护的主文档。
@@ -107,7 +153,7 @@ jkm sync [--scope local|user] [--lock-file <path>]
 - `network.ca_cert` 持久化时会转换为绝对路径。
 - 镜像地址写入时会去掉末尾的 `/`。
 - 未显式配置镜像时，下载器会根据本机时区判断地区：中国时区使用内置的非淘宝国内镜像（在兼容的源上启用），其他地区使用官方源。
-- èªå¨éæ©çå½åéåå¨åæ°æ®ãæ ¡éªåæå½æ¡£è¯·æ±å¤±è´¥æ¶ä¼åéå°å®æ¹æºã
+- 自动选择的国内镜像在元数据、校验和或归档请求失败时会回退到官方源。
 - 为规避已知镜像侧问题，包含 `taobao`、`npmmirror` 或 `cnpmjs` 的淘宝系镜像地址会被忽略。
 - 下载器优先使用持久化后的 `JDKM_*` 配置；如果未设置，再回退到进程中的 `HTTP_PROXY`、`HTTPS_PROXY`、`SSL_CERT_FILE` 等标准环境变量。
 - 所有运行时 provider 共用同一层下载与网络辅助逻辑。
@@ -171,30 +217,6 @@ jkm sync
 - 下载失败会自动退避重试。
 - 上游支持范围请求时，会从 `.partial` 文件继续下载。
 - 只有下载完整后，文件才会原子落到最终路径。
-
-## 构建与安装
-
-Windows 构建命令：
-
-```powershell
-.\build.ps1
-```
-
-默认产物：
-
-- `build\jkm.exe`
-
-当前用户安装命令：
-
-```powershell
-.\scripts\install-jkm.ps1
-```
-
-默认路径：
-
-- 可执行文件：`%LOCALAPPDATA%\Programs\JdkManagement\bin\jkm.exe`
-- 数据根目录：`%LOCALAPPDATA%\JdkManagement`
-- 如设置 `JDKM_HOME`，则优先使用该目录作为数据根
 
 ## 目录结构
 

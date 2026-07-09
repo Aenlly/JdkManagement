@@ -4,6 +4,52 @@
 
 JdkManagement is a Windows-first runtime manager prototype written in C++. It provides one CLI for installing, selecting, querying, and activating Java, Python, Node.js, Go, Maven, and Gradle runtimes.
 
+## Download and Install
+
+For normal installation, download the release package instead of running PowerShell scripts directly:
+
+- [Latest JdkManagement Release](https://github.com/Aenlly/JdkManagement/releases/latest)
+
+Download the Windows x64 package from **Assets**:
+
+```text
+JdkManagement-windows-x64.zip
+```
+
+Extract the package and run the installer executable:
+
+```powershell
+.\JdkManagement-Setup-windows-x64.exe
+```
+
+The release package also includes an uninstaller executable:
+
+```powershell
+.\JdkManagement-Uninstall-windows-x64.exe
+```
+
+You can also uninstall from Windows Settings > Apps > JdkManagement.
+
+Default paths:
+
+- Executable: `%LOCALAPPDATA%\Programs\JdkManagement\bin\jkm.exe`
+- Uninstaller: `%LOCALAPPDATA%\Programs\JdkManagement\jkm-uninstall.exe`
+- Data root: `%LOCALAPPDATA%\JdkManagement`
+- Override data root with `JDKM_HOME`
+
+See [download and installation guide](docs/download.md) for the full user flow.
+
+### Build from source
+
+Developers can build and package locally:
+
+```powershell
+.\build.ps1
+.\scripts\package-jkm.ps1
+```
+
+The generated release package is written under `out\package`.
+
 ## Documentation Maintenance
 
 - `README.md` and `README.zh-CN.md` are required project documents.
@@ -171,30 +217,6 @@ Download behavior is centralized in a shared helper used by all runtime provider
 - Failed downloads retry automatically with backoff.
 - Partial files are resumed when the upstream server supports range requests.
 - Final files are moved into place only after a completed transfer.
-
-## Build and Install
-
-Build on Windows:
-
-```powershell
-.\build.ps1
-```
-
-Default output:
-
-- `build\jkm.exe`
-
-Install for the current user:
-
-```powershell
-.\scripts\install-jkm.ps1
-```
-
-Default paths:
-
-- Executable: `%LOCALAPPDATA%\Programs\JdkManagement\bin\jkm.exe`
-- Data root: `%LOCALAPPDATA%\JdkManagement`
-- Override data root with `JDKM_HOME`
 
 ## Directory Layout
 
